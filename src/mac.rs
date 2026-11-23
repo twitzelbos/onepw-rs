@@ -33,7 +33,10 @@ pub fn request_mac(
     let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
     let path = url.path().trim_start_matches('/');
     let query = url.query().unwrap_or("");
-    let message = format!("{session_id}|{}|{host}/{path}?{query}|v1|{request_id}", method.to_ascii_uppercase());
+    let message = format!(
+        "{session_id}|{}|{host}/{path}?{query}|v1|{request_id}",
+        method.to_ascii_uppercase()
+    );
 
     let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&mac_key).expect("any key length");
     mac.update(message.as_bytes());
@@ -53,21 +56,54 @@ mod tests {
     #[test]
     fn matches_1password_vectors() {
         let cases: [(&str, &str, u32, &str, &str, &str); 5] = [
-            ("v1|6|oBnE8JLpG2Othzgy", "RDPMIFQWUJBWZFDBKURHNRFVRA", 6, "GET",
-             "https://my.b5local.com:3000/api/v1/invites", "ETmGs4U7ReMolW1J64ZAmmksXbQFFbeyRPW6zPWj3VM"),
-            ("v1|7|E2w1PDPlDRKaVEQs", "RDPMIFQWUJBWZFDBKURHNRFVRA", 7, "GET",
-             "https://my.b5local.com:3000/api/v2/users?limit=25&states=P&types=G,R", "ETmGs4U7ReMolW1J64ZAmmksXbQFFbeyRPW6zPWj3VM"),
-            ("v1|7|JDqt1exoqPCjZiAJ", "QVLABIG34RB3TMH7ZJEW47CCKE", 7, "GET",
-             "https://my.b5local.com:3000/api/v1/vaults?permission=read&attrs=accessor-previews%2Ccombined-access",
-             "-K_oZ-mtamTiLJODQn5cVhXQX-nFmPI2kosmWmOWfZg"),
-            ("v1|3907223784|Htb-Sn_9k4u59wOz", "VADBXWG7FVC6FIOKOJ4DBGE4SY", 3907223784, "DELETE",
-             "https://awesome.b5dev.com/api/v1/vault/p3nfd4jax622nqjos7licewuyn", "xvoJlJo7KkJGQ55-mjd7tOBE6YvRYnGBNpPoo3_F2M0"),
-            ("v1|781158249|kkvpSd6stufwwlsZ", "2UG2ZGCDLFAWRHPETAV325EL5U", 781158249, "GET",
-             "https://awesome.b5dev.com/api/v1/auditevents/0/older?object_types=gva,invite", "WDs9nvg0DYYmQmucwPZ25FV6uUSaYsJUgse7apbs6rk"),
+            (
+                "v1|6|oBnE8JLpG2Othzgy",
+                "RDPMIFQWUJBWZFDBKURHNRFVRA",
+                6,
+                "GET",
+                "https://my.b5local.com:3000/api/v1/invites",
+                "ETmGs4U7ReMolW1J64ZAmmksXbQFFbeyRPW6zPWj3VM",
+            ),
+            (
+                "v1|7|E2w1PDPlDRKaVEQs",
+                "RDPMIFQWUJBWZFDBKURHNRFVRA",
+                7,
+                "GET",
+                "https://my.b5local.com:3000/api/v2/users?limit=25&states=P&types=G,R",
+                "ETmGs4U7ReMolW1J64ZAmmksXbQFFbeyRPW6zPWj3VM",
+            ),
+            (
+                "v1|7|JDqt1exoqPCjZiAJ",
+                "QVLABIG34RB3TMH7ZJEW47CCKE",
+                7,
+                "GET",
+                "https://my.b5local.com:3000/api/v1/vaults?permission=read&attrs=accessor-previews%2Ccombined-access",
+                "-K_oZ-mtamTiLJODQn5cVhXQX-nFmPI2kosmWmOWfZg",
+            ),
+            (
+                "v1|3907223784|Htb-Sn_9k4u59wOz",
+                "VADBXWG7FVC6FIOKOJ4DBGE4SY",
+                3907223784,
+                "DELETE",
+                "https://awesome.b5dev.com/api/v1/vault/p3nfd4jax622nqjos7licewuyn",
+                "xvoJlJo7KkJGQ55-mjd7tOBE6YvRYnGBNpPoo3_F2M0",
+            ),
+            (
+                "v1|781158249|kkvpSd6stufwwlsZ",
+                "2UG2ZGCDLFAWRHPETAV325EL5U",
+                781158249,
+                "GET",
+                "https://awesome.b5dev.com/api/v1/auditevents/0/older?object_types=gva,invite",
+                "WDs9nvg0DYYmQmucwPZ25FV6uUSaYsJUgse7apbs6rk",
+            ),
         ];
         for (expected, sid, rid, method, url, k) in cases {
             let url = reqwest::Url::parse(url).unwrap();
-            assert_eq!(request_mac(&key(k), sid, rid, method, &url), expected, "{url}");
+            assert_eq!(
+                request_mac(&key(k), sid, rid, method, &url),
+                expected,
+                "{url}"
+            );
         }
     }
 }

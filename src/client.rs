@@ -17,13 +17,13 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use rand::Rng;
 use reqwest::{Method, Url};
-use serde::de::DeserializeOwned;
 use serde::Deserialize;
-use serde_json::{json, Value};
+use serde::de::DeserializeOwned;
+use serde_json::{Value, json};
 use zeroize::Zeroizing;
 
 use crate::error::{Error, Result};
-use crate::keys::{decrypt_keysets, EncryptedKeyset, EncryptedObject, Keyset, SymmetricKey};
+use crate::keys::{EncryptedKeyset, EncryptedObject, Keyset, SymmetricKey, decrypt_keysets};
 use crate::secret_key::SecretKey;
 use crate::{b64, kdf, mac, srp};
 
@@ -108,7 +108,12 @@ pub struct SignInOptions {
 impl SignInOptions {
     /// Options with a fresh device UUID and default identity.
     pub fn new() -> Self {
-        SignInOptions { device_uuid: new_device_uuid(), identity: ClientIdentity::default(), totp: None, base_url: None }
+        SignInOptions {
+            device_uuid: new_device_uuid(),
+            identity: ClientIdentity::default(),
+            totp: None,
+            base_url: None,
+        }
     }
 }
 
@@ -122,7 +127,9 @@ impl Default for SignInOptions {
 pub fn new_device_uuid() -> String {
     const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz234567";
     let mut rng = rand::thread_rng();
-    (0..26).map(|_| ALPHABET[rng.gen_range(0..32)] as char).collect()
+    (0..26)
+        .map(|_| ALPHABET[rng.gen_range(0..32)] as char)
+        .collect()
 }
 
 /// A signed-in, unlocked account.
@@ -134,7 +141,10 @@ pub struct Account {
 
 impl std::fmt::Debug for Account {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Account").field("base", &self.rest.base.as_str()).field("keysets", &self.keysets.len()).finish()
+        f.debug_struct("Account")
+            .field("base", &self.rest.base.as_str())
+            .field("keysets", &self.keysets.len())
+            .finish()
     }
 }
 
@@ -178,7 +188,10 @@ pub struct Item {
 impl Item {
     /// The item's title.
     pub fn title(&self) -> &str {
-        self.overview.get("title").and_then(Value::as_str).unwrap_or("")
+        self.overview
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or("")
     }
 
     /// Finds a field value by its name, label or designation (`"username"`, `"password"`,
@@ -188,7 +201,9 @@ impl Item {
         let d = &self.details;
         if let Some(fields) = d.get("fields").and_then(Value::as_array) {
             for f in fields {
-                let hit = ["designation", "name"].iter().any(|k| f.get(*k).and_then(Value::as_str) == Some(name));
+                let hit = ["designation", "name"]
+                    .iter()
+                    .any(|k| f.get(*k).and_then(Value::as_str) == Some(name));
                 if hit {
                     return f.get("value").and_then(Value::as_str);
                 }
@@ -199,9 +214,21 @@ impl Item {
                 return Some(p);
             }
         }
-        for s in d.get("sections").and_then(Value::as_array).into_iter().flatten() {
-            for f in s.get("fields").and_then(Value::as_array).into_iter().flatten() {
-                let hit = ["t", "n"].iter().any(|k| f.get(*k).and_then(Value::as_str) == Some(name));
+        for s in d
+            .get("sections")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            for f in s
+                .get("fields")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let hit = ["t", "n"]
+                    .iter()
+                    .any(|k| f.get(*k).and_then(Value::as_str) == Some(name));
                 if hit {
                     return f.get("v").and_then(Value::as_str);
                 }
@@ -216,8 +243,11 @@ impl Account {
     pub async fn sign_in(creds: &Credentials, opts: SignInOptions) -> Result<Account> {
         let base = match &opts.base_url {
             Some(u) => u.clone(),
-            None => Url::parse(&format!("https://{}/api/", creds.sign_in_address.trim_end_matches('/')))
-                .map_err(|e| Error::InvalidInput(format!("sign-in address: {e}")))?,
+            None => Url::parse(&format!(
+                "https://{}/api/",
+                creds.sign_in_address.trim_end_matches('/')
+            ))
+            .map_err(|e| Error::InvalidInput(format!("sign-in address: {e}")))?,
         };
         let http = reqwest::Client::builder().build()?;
         let mut rest = Rest::new(http, base, &opts.identity, &opts.device_uuid);
@@ -228,38 +258,71 @@ impl Account {
         if start.account_key_format.as_deref() != Some(sk.format())
             || start.account_key_uuid.as_deref() != Some(sk.account_id())
         {
-            return Err(Error::InvalidInput("Secret Key doesn't belong to this account".into()));
+            return Err(Error::InvalidInput(
+                "Secret Key doesn't belong to this account".into(),
+            ));
         }
         rest.session_id = Some(start.session_id.clone());
         let auth = start.user_auth;
 
         // 2. SRP: A → B.
         let salt = b64::decode(&auth.salt)?;
-        let x = kdf::srp_x(&creds.password, sk, &creds.email, &auth.method, &salt, auth.iterations)?;
+        let x = kdf::srp_x(
+            &creds.password,
+            sk,
+            &creds.email,
+            &auth.method,
+            &salt,
+            auth.iterations,
+        )?;
         let client = srp::Client::new_standard(srp::Group::for_method(&auth.method)?, x.as_ref());
-        let resp: Value = rest.post_plain("v2/auth", &json!({"userA": client.public_a_hex()})).await?;
-        let big_b = srp::from_server_hex(resp["userB"].as_str().ok_or_else(|| Error::Protocol("no userB".into()))?)?;
+        let resp: Value = rest
+            .post_plain("v2/auth", &json!({"userA": client.public_a_hex()}))
+            .await?;
+        let big_b = srp::from_server_hex(
+            resp["userB"]
+                .as_str()
+                .ok_or_else(|| Error::Protocol("no userB".into()))?,
+        )?;
         let key = client.session_key(&big_b)?;
 
         // 3. Mutual proof.
         let identity = srp::identity(&creds.email, sk.account_id());
         let m1 = client.client_proof(&big_b, &key, &identity, &salt);
-        let resp: Value = match rest.post_plain("v2/auth/confirm-key", &json!({"clientVerifyHash": b64::encode(&m1)})).await {
+        let resp: Value = match rest
+            .post_plain(
+                "v2/auth/confirm-key",
+                &json!({"clientVerifyHash": b64::encode(&m1)}),
+            )
+            .await
+        {
             Err(Error::Server { status: 401, .. }) => {
-                return Err(Error::InvalidInput("wrong account password or Secret Key".into()))
+                return Err(Error::InvalidInput(
+                    "wrong account password or Secret Key".into(),
+                ));
             }
             other => other?,
         };
-        let server_hash = b64::decode(resp["serverVerifyHash"].as_str().ok_or_else(|| Error::Protocol("no serverVerifyHash".into()))?)?;
+        let server_hash = b64::decode(
+            resp["serverVerifyHash"]
+                .as_str()
+                .ok_or_else(|| Error::Protocol("no serverVerifyHash".into()))?,
+        )?;
         client.verify_server_confirmation(&m1, &key, &server_hash)?;
 
         // 4. Encrypted + MAC'd from here on.
         rest.session_key = Some(SymmetricKey::new(start.session_id.clone(), *key.as_bytes()));
         rest.request_id = AtomicU32::new(rand::thread_rng().gen_range(1..u32::MAX / 2));
         let complete: Value = rest
-            .post("v2/auth/complete", &json!({"client": opts.identity.client_id(), "device": device_body(&opts)}))
+            .post(
+                "v2/auth/complete",
+                &json!({"client": opts.identity.client_id(), "device": device_body(&opts)}),
+            )
             .await?;
-        let user_uuid = complete.get("userUuid").and_then(Value::as_str).map(str::to_owned);
+        let user_uuid = complete
+            .get("userUuid")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
         if let Some(mfa) = complete.get("mfa").filter(|m| !m.is_null()) {
             second_factor(&rest, mfa, &opts, &start.session_id).await?;
         }
@@ -278,11 +341,20 @@ impl Account {
             sk,
             &creds.email,
             esk.alg.as_deref().unwrap_or(kdf::ALG_PBES2G_HS256),
-            &b64::decode(esk.p2s.as_deref().ok_or_else(|| Error::Malformed("encSymKey without p2s".into()))?)?,
-            esk.p2c.ok_or_else(|| Error::Malformed("encSymKey without p2c".into()))?,
+            &b64::decode(
+                esk.p2s
+                    .as_deref()
+                    .ok_or_else(|| Error::Malformed("encSymKey without p2s".into()))?,
+            )?,
+            esk.p2c
+                .ok_or_else(|| Error::Malformed("encSymKey without p2c".into()))?,
         )?;
         let keysets = decrypt_keysets(&ks.keysets, &auk)?;
-        Ok(Account { rest, keysets, user_uuid })
+        Ok(Account {
+            rest,
+            keysets,
+            user_uuid,
+        })
     }
 
     /// The signed-in user's UUID, if the server reported it.
@@ -294,24 +366,39 @@ impl Account {
     pub async fn vaults(&self) -> Result<Vec<Vault>> {
         let account: Value = self.rest.get("v1/account?attrs=me,vaults").await?;
         let mut out = Vec::new();
-        for v in account.get("vaults").and_then(Value::as_array).into_iter().flatten() {
+        for v in account
+            .get("vaults")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
             let raw: RawVault = serde_json::from_value(v.clone())?;
-            let Some(key) = self.vault_key(&raw.access) else { continue };
+            let Some(key) = self.vault_key(&raw.access) else {
+                continue;
+            };
             let attrs = match &raw.enc_attrs {
                 Some(a) => a.decrypt_json(&key).unwrap_or(Value::Null),
                 None => Value::Null,
             };
-            out.push(Vault { uuid: raw.uuid, vault_type: raw.vault_type, attrs, active_item_count: raw.active_item_count, key });
+            out.push(Vault {
+                uuid: raw.uuid,
+                vault_type: raw.vault_type,
+                attrs,
+                active_item_count: raw.active_item_count,
+                key,
+            });
         }
         Ok(out)
     }
 
     fn vault_key(&self, access: &[RawAccess]) -> Option<SymmetricKey> {
         for a in access {
-            if a.acl.map_or(true, |acl| acl & 32 == 0) {
+            if a.acl.is_none_or(|acl| acl & 32 == 0) {
                 continue; // no read access through this grant
             }
-            let Some(ks) = self.keysets.iter().find(|k| k.uuid == a.enc_vault_key.kid) else { continue };
+            let Some(ks) = self.keysets.iter().find(|k| k.uuid == a.enc_vault_key.kid) else {
+                continue;
+            };
             if let Ok(jwk) = ks.private.decrypt_object_jwk(&a.enc_vault_key) {
                 if let Ok(k) = SymmetricKey::from_jwk(&jwk) {
                     return Some(k);
@@ -327,7 +414,10 @@ impl Account {
         let mut out = Vec::new();
         let mut batch: u64 = 0;
         loop {
-            let resp: ItemsBatch = self.rest.get(&format!("v1/vault/{}/{batch}/items", vault.uuid)).await?;
+            let resp: ItemsBatch = self
+                .rest
+                .get(&format!("v1/vault/{}/{batch}/items", vault.uuid))
+                .await?;
             for it in resp.items {
                 out.push(Item {
                     overview: it.enc_overview.decrypt_json(&vault.key)?,
@@ -355,19 +445,27 @@ impl Account {
             .ok_or_else(|| Error::InvalidInput("reference must start with op://".into()))?;
         let parts: Vec<&str> = rest.split('/').collect();
         let [vault_ref, item_ref, field] = parts[..] else {
-            return Err(Error::InvalidInput("expected op://<vault>/<item>/<field>".into()));
+            return Err(Error::InvalidInput(
+                "expected op://<vault>/<item>/<field>".into(),
+            ));
         };
         let vaults = self.vaults().await?;
         let vault = vaults
             .iter()
-            .find(|v| v.uuid == vault_ref || v.name() == vault_ref || (vault_ref == "Private" && v.vault_type == "P"))
+            .find(|v| {
+                v.uuid == vault_ref
+                    || v.name() == vault_ref
+                    || (vault_ref == "Private" && v.vault_type == "P")
+            })
             .ok_or_else(|| Error::InvalidInput(format!("no readable vault {vault_ref:?}")))?;
         let items = self.items(vault).await?;
         let item = items
             .iter()
             .filter(|i| !i.trashed)
             .find(|i| i.uuid == item_ref || i.title() == item_ref)
-            .ok_or_else(|| Error::InvalidInput(format!("no item {item_ref:?} in vault {vault_ref:?}")))?;
+            .ok_or_else(|| {
+                Error::InvalidInput(format!("no item {item_ref:?} in vault {vault_ref:?}"))
+            })?;
         item.field(field)
             .map(|v| Zeroizing::new(v.to_string()))
             .ok_or_else(|| Error::InvalidInput(format!("item {item_ref:?} has no field {field:?}")))
@@ -375,15 +473,23 @@ impl Account {
 
     /// Ends the session on the server.
     pub async fn sign_out(self) -> Result<()> {
-        let _: Value = self.rest.request(Method::PUT, "v1/session/signout", None).await.or_else(|e| match e {
-            Error::Malformed(_) => Ok(Value::Null), // empty body
-            e => Err(e),
-        })?;
+        let _: Value = self
+            .rest
+            .request(Method::PUT, "v1/session/signout", None)
+            .await
+            .or_else(|e| match e {
+                Error::Malformed(_) => Ok(Value::Null), // empty body
+                e => Err(e),
+            })?;
         Ok(())
     }
 }
 
-async fn start_session(rest: &mut Rest, creds: &Credentials, opts: &SignInOptions) -> Result<StartResponse> {
+async fn start_session(
+    rest: &mut Rest,
+    creds: &Credentials,
+    opts: &SignInOptions,
+) -> Result<StartResponse> {
     let sk = &creds.secret_key;
     for _ in 0..3 {
         let start: StartResponse = rest
@@ -407,17 +513,33 @@ async fn start_session(rest: &mut Rest, creds: &Credentials, opts: &SignInOption
             "device-deleted" => {
                 rest.session_id = Some(start.session_id.clone());
                 let _: Value = rest
-                    .request(Method::PUT, &format!("v1/device/{}/reauthorize", opts.device_uuid), None)
+                    .request(
+                        Method::PUT,
+                        &format!("v1/device/{}/reauthorize", opts.device_uuid),
+                        None,
+                    )
                     .await?;
             }
             other => return Err(Error::Protocol(format!("auth/start status {other:?}"))),
         }
     }
-    Err(Error::Protocol("device registration did not take effect".into()))
+    Err(Error::Protocol(
+        "device registration did not take effect".into(),
+    ))
 }
 
-async fn second_factor(rest: &Rest, mfa: &Value, opts: &SignInOptions, session_id: &str) -> Result<()> {
-    let enabled = |k: &str| mfa.get(k).and_then(|v| v.get("enabled")).and_then(Value::as_bool).unwrap_or(false);
+async fn second_factor(
+    rest: &Rest,
+    mfa: &Value,
+    opts: &SignInOptions,
+    session_id: &str,
+) -> Result<()> {
+    let enabled = |k: &str| {
+        mfa.get(k)
+            .and_then(|v| v.get("enabled"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    };
     if enabled("totp") {
         let ask = opts.totp.as_ref().ok_or_else(|| {
             Error::Unsupported("this account needs a 2FA code: set SignInOptions::totp".into())
@@ -431,9 +553,14 @@ async fn second_factor(rest: &Rest, mfa: &Value, opts: &SignInOptions, session_i
             .await?;
         return Ok(());
     }
-    let any = mfa.as_object().map(|m| m.values().any(|v| v.get("enabled").and_then(Value::as_bool) == Some(true)));
+    let any = mfa.as_object().map(|m| {
+        m.values()
+            .any(|v| v.get("enabled").and_then(Value::as_bool) == Some(true))
+    });
     if any == Some(true) {
-        return Err(Error::Unsupported("only authenticator-app (TOTP) 2FA is supported so far".into()));
+        return Err(Error::Unsupported(
+            "only authenticator-app (TOTP) 2FA is supported so far".into(),
+        ));
     }
     Ok(())
 }
@@ -463,23 +590,37 @@ impl Rest {
     fn new(http: reqwest::Client, base: Url, identity: &ClientIdentity, device_uuid: &str) -> Rest {
         use reqwest::header::{HeaderMap, HeaderValue, USER_AGENT};
         let mut headers = HeaderMap::new();
-        let v = |s: String| HeaderValue::from_str(&s).unwrap_or_else(|_| HeaderValue::from_static("onepw"));
+        let v = |s: String| {
+            HeaderValue::from_str(&s).unwrap_or_else(|_| HeaderValue::from_static("onepw"))
+        };
         headers.insert(CLIENT_HEADER, v(identity.client_id()));
         headers.insert(USER_AGENT, v(identity.client_id()));
         headers.insert(OP_USER_AGENT_HEADER, v(identity.op_user_agent(device_uuid)));
-        Rest { http, base, headers, session_id: None, session_key: None, request_id: AtomicU32::new(1) }
+        Rest {
+            http,
+            base,
+            headers,
+            session_id: None,
+            session_key: None,
+            request_id: AtomicU32::new(1),
+        }
     }
 
     /// Unencrypted JSON POST (before the session key is confirmed).
     async fn post_plain<T: DeserializeOwned>(&self, path: &str, body: &Value) -> Result<T> {
-        self.send(Method::POST, path, Some(body.clone()), false).await
+        self.send(Method::POST, path, Some(body.clone()), false)
+            .await
     }
 
     /// Encrypted JSON POST.
     async fn post<T: DeserializeOwned>(&self, path: &str, body: &Value) -> Result<T> {
-        let key = self.session_key.as_ref().ok_or_else(|| Error::Protocol("not signed in".into()))?;
+        let key = self
+            .session_key
+            .as_ref()
+            .ok_or_else(|| Error::Protocol("not signed in".into()))?;
         let env = EncryptedObject::encrypt(key, "b5+jwk+json", &serde_json::to_vec(body)?);
-        self.send(Method::POST, path, Some(serde_json::to_value(env)?), true).await
+        self.send(Method::POST, path, Some(serde_json::to_value(env)?), true)
+            .await
     }
 
     /// Encrypted GET.
@@ -487,20 +628,40 @@ impl Rest {
         self.send(Method::GET, path, None, true).await
     }
 
-    async fn request<T: DeserializeOwned>(&self, method: Method, path: &str, body: Option<Value>) -> Result<T> {
+    async fn request<T: DeserializeOwned>(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<Value>,
+    ) -> Result<T> {
         let encrypted = self.session_key.is_some();
         self.send(method, path, body, encrypted).await
     }
 
-    async fn send<T: DeserializeOwned>(&self, method: Method, path: &str, body: Option<Value>, encrypted: bool) -> Result<T> {
-        let url = self.base.join(path).map_err(|e| Error::InvalidInput(format!("url: {e}")))?;
-        let mut req = self.http.request(method.clone(), url.clone()).headers(self.headers.clone());
+    async fn send<T: DeserializeOwned>(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<Value>,
+        encrypted: bool,
+    ) -> Result<T> {
+        let url = self
+            .base
+            .join(path)
+            .map_err(|e| Error::InvalidInput(format!("url: {e}")))?;
+        let mut req = self
+            .http
+            .request(method.clone(), url.clone())
+            .headers(self.headers.clone());
         if let Some(sid) = &self.session_id {
             req = req.header(SESSION_HEADER, sid);
         }
         if let (Some(key), Some(sid)) = (&self.session_key, &self.session_id) {
             let id = self.request_id.fetch_add(1, Ordering::Relaxed);
-            req = req.header(MAC_HEADER, mac::request_mac(key.as_bytes(), sid, id, method.as_str(), &url));
+            req = req.header(
+                MAC_HEADER,
+                mac::request_mac(key.as_bytes(), sid, id, method.as_str(), &url),
+            );
         }
         if let Some(b) = body {
             req = req.json(&b);
@@ -509,9 +670,16 @@ impl Rest {
         let status = resp.status();
         let text = resp.text().await?;
         if !status.is_success() {
-            return Err(Error::Server { status: status.as_u16(), body: truncate(&text) });
+            return Err(Error::Server {
+                status: status.as_u16(),
+                body: truncate(&text),
+            });
         }
-        let value: Value = if text.trim().is_empty() { Value::Null } else { serde_json::from_str(&text)? };
+        let value: Value = if text.trim().is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_str(&text)?
+        };
         let value = match (encrypted, &self.session_key) {
             (true, Some(key)) if value.get("enc").is_some() && value.get("data").is_some() => {
                 let env: EncryptedObject = serde_json::from_value(value)?;
@@ -520,8 +688,15 @@ impl Rest {
             _ => value,
         };
         if let Some(code) = value.get("errorCode").and_then(Value::as_i64) {
-            let msg = value.get("errorMessage").and_then(Value::as_str).unwrap_or("").to_string();
-            return Err(Error::Server { status: code as u16, body: msg });
+            let msg = value
+                .get("errorMessage")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            return Err(Error::Server {
+                status: code as u16,
+                body: msg,
+            });
         }
         Ok(serde_json::from_value(value)?)
     }

@@ -13,7 +13,7 @@ An **unofficial**, pure-Rust client for 1Password accounts. It signs in with you
 | SRP-6a (1Password variants), 2SKD key derivation, Secret Key parsing | ✅ matches 1Password's published test vectors |
 | Request MAC (`X-AgileBits-MAC`), session encryption | ✅ matches 1Password's published test vectors |
 | Keysets → vault keys → items (AES-256-GCM, RSA-OAEP / OAEP-256) | ✅ tested end-to-end against a simulated server |
-| Sign-in against the **real** 1Password service | ⚠️ not yet verified |
+| Sign-in against the **real** 1Password service | ✅ verified 2026-11-23 on an individual account (my.1password.com): sign-in, personal and shared vaults, all items decrypted |
 | 2FA | authenticator app (TOTP) only. Security keys, Duo and SSO accounts are not supported |
 | Writing (create/edit items) | ❌ read-only |
 

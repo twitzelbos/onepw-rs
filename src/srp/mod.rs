@@ -94,7 +94,7 @@ impl Group {
 
     /// `value mod N` as big-endian bytes, left-padded to the byte length of N.
     fn pad(&self, value: &BigUint) -> Vec<u8> {
-        let len = (self.n.bits() + 7) / 8;
+        let len = self.n.bits().div_ceil(8);
         let bytes = (value % &self.n).to_bytes_be();
         let mut out = vec![0u8; len.saturating_sub(bytes.len())];
         out.extend_from_slice(&bytes);
@@ -173,7 +173,14 @@ impl Client {
         let k = k.unwrap_or_else(|| group.default_k());
         let a_int = BigUint::from_bytes_be(a);
         let big_a = group.g.modpow(&a_int, &group.n);
-        Client { variant: Variant::Legacy, group, x: Zeroizing::new(x.to_vec()), k, a: Zeroizing::new(a.to_vec()), big_a }
+        Client {
+            variant: Variant::Legacy,
+            group,
+            x: Zeroizing::new(x.to_vec()),
+            k,
+            a: Zeroizing::new(a.to_vec()),
+            big_a,
+        }
     }
 
     /// The client's public value A, sent to the server.
@@ -184,7 +191,9 @@ impl Client {
     /// The verifier `v = g^x mod N`. A client only needs this when registering or changing
     /// credentials.
     pub fn verifier(&self) -> BigUint {
-        self.group.g.modpow(&BigUint::from_bytes_be(&self.x), &self.group.n)
+        self.group
+            .g
+            .modpow(&BigUint::from_bytes_be(&self.x), &self.group.n)
     }
 
     /// Computes the shared session key from the server's public value B.
@@ -203,12 +212,23 @@ impl Client {
 
     /// Current flow: the client's proof `M1 = SHA256((H(N) ⊕ H(g)) ‖ H(I) ‖ salt ‖ A ‖ B ‖ K)`,
     /// sent first. `identity` is [`identity`]`(email, account_id)`.
-    pub fn client_proof(&self, big_b: &BigUint, key: &SessionKey, identity: &str, salt: &[u8]) -> [u8; 32] {
+    pub fn client_proof(
+        &self,
+        big_b: &BigUint,
+        key: &SessionKey,
+        identity: &str,
+        salt: &[u8],
+    ) -> [u8; 32] {
         self.server_proof(big_b, key, identity, salt)
     }
 
     /// Current flow: checks the server's answer `SHA256(A ‖ M1 ‖ K)`.
-    pub fn verify_server_confirmation(&self, m1: &[u8; 32], key: &SessionKey, server_hash: &[u8]) -> Result<()> {
+    pub fn verify_server_confirmation(
+        &self,
+        m1: &[u8; 32],
+        key: &SessionKey,
+        server_hash: &[u8],
+    ) -> Result<()> {
         let mut h = Sha256::new();
         h.update(self.big_a.to_bytes_be());
         h.update(m1);
@@ -217,7 +237,9 @@ impl Client {
         if bool::from(expected.as_slice().ct_eq(server_hash)) {
             Ok(())
         } else {
-            Err(Error::Protocol("server SRP confirmation did not verify".into()))
+            Err(Error::Protocol(
+                "server SRP confirmation did not verify".into(),
+            ))
         }
     }
 
@@ -225,7 +247,9 @@ impl Client {
         let n = &self.group.n;
         let b_mod = big_b % n;
         if b_mod == BigUint::from(0u32) || b_mod == BigUint::from(1u32) {
-            return Err(Error::Protocol("server sent an invalid SRP public value B".into()));
+            return Err(Error::Protocol(
+                "server sent an invalid SRP public value B".into(),
+            ));
         }
         if *u == BigUint::from(0u32) {
             return Err(Error::Protocol("SRP scrambling parameter u is zero".into()));
@@ -265,7 +289,13 @@ impl Client {
     }
 
     /// The proof the server is expected to send: `SHA256((H(N) ⊕ H(g)) ‖ H(I) ‖ salt ‖ A ‖ B ‖ K)`.
-    pub fn server_proof(&self, big_b: &BigUint, key: &SessionKey, username: &str, salt: &[u8]) -> [u8; 32] {
+    pub fn server_proof(
+        &self,
+        big_b: &BigUint,
+        key: &SessionKey,
+        username: &str,
+        salt: &[u8],
+    ) -> [u8; 32] {
         let hn = Sha256::digest(self.group.n.to_bytes_be());
         let hg = Sha256::digest(self.group.g.to_bytes_be());
         let xor: Vec<u8> = hn.iter().zip(hg.iter()).map(|(a, b)| a ^ b).collect();
@@ -303,7 +333,8 @@ pub fn from_server_hex(h: &str) -> Result<BigUint> {
     if h.is_empty() || h.len() > 1024 || !h.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(Error::Protocol("invalid SRP value from server".into()));
     }
-    BigUint::parse_bytes(h.as_bytes(), 16).ok_or_else(|| Error::Protocol("invalid SRP value from server".into()))
+    BigUint::parse_bytes(h.as_bytes(), 16)
+        .ok_or_else(|| Error::Protocol("invalid SRP value from server".into()))
 }
 
 /// `u = SHA256(hex(A) ‖ hex(B))`, lowercase hex with leading zeros stripped.
@@ -386,7 +417,12 @@ mod tests {
         let u = int("dad353365f78590c1857b29f16e3a947df4707868e2dd2d2b4eafd35c8c854a1");
         // k as used in the Go test: the raw ASCII bytes of a 1Password session ID.
         let k = BigUint::from_bytes_be(b"H27JRK5M4NBJXOBCOETCVXJHFA");
-        let c = Client::with_ephemeral(rfc5054_4096(), &int(X).to_bytes_be(), Some(k), &a.to_bytes_be());
+        let c = Client::with_ephemeral(
+            rfc5054_4096(),
+            &int(X).to_bytes_be(),
+            Some(k),
+            &a.to_bytes_be(),
+        );
         let key = c.session_key_with_u(&b, &u).unwrap();
         assert_eq!(
             hex::encode(key.as_bytes()),
@@ -437,8 +473,16 @@ mod tests {
         hs.update(m1);
         hs.update(key.as_bytes());
         let server_hash: [u8; 32] = hs.finalize().into();
-        assert!(client.verify_server_confirmation(&m1, &key, &server_hash).is_ok());
-        assert!(client.verify_server_confirmation(&m1, &key, &[0u8; 32]).is_err());
+        assert!(
+            client
+                .verify_server_confirmation(&m1, &key, &server_hash)
+                .is_ok()
+        );
+        assert!(
+            client
+                .verify_server_confirmation(&m1, &key, &[0u8; 32])
+                .is_err()
+        );
     }
 
     #[test]
@@ -487,7 +531,15 @@ mod tests {
         assert_eq!(key.as_bytes(), &k_server);
 
         let m = client.server_proof(&big_b, &key, "polly@cracker.example", b"salt");
-        assert!(client.verify_server_and_prove(&big_b, &key, "polly@cracker.example", b"salt", &m).is_ok());
-        assert!(client.verify_server_and_prove(&big_b, &key, "polly@cracker.example", b"salt", &[0u8; 32]).is_err());
+        assert!(
+            client
+                .verify_server_and_prove(&big_b, &key, "polly@cracker.example", b"salt", &m)
+                .is_ok()
+        );
+        assert!(
+            client
+                .verify_server_and_prove(&big_b, &key, "polly@cracker.example", b"salt", &[0u8; 32])
+                .is_err()
+        );
     }
 }

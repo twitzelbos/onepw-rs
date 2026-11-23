@@ -56,12 +56,20 @@ pub fn two_secret_kdf(
 
     let password = normalize_password(password);
     let mut out = Zeroizing::new([0u8; 32]);
-    pbkdf2::pbkdf2_hmac::<Sha256>(password.as_bytes(), stretched_salt.as_ref(), iterations, out.as_mut());
+    pbkdf2::pbkdf2_hmac::<Sha256>(
+        password.as_bytes(),
+        stretched_salt.as_ref(),
+        iterations,
+        out.as_mut(),
+    );
 
     let mut k_a = Zeroizing::new([0u8; 32]);
-    Hkdf::<Sha256>::new(Some(secret_key.account_id().as_bytes()), secret_key.secret().as_bytes())
-        .expand(secret_key.format().as_bytes(), k_a.as_mut())
-        .expect("32 bytes is a valid HKDF length");
+    Hkdf::<Sha256>::new(
+        Some(secret_key.account_id().as_bytes()),
+        secret_key.secret().as_bytes(),
+    )
+    .expand(secret_key.format().as_bytes(), k_a.as_mut())
+    .expect("32 bytes is a valid HKDF length");
 
     for (o, k) in out.iter_mut().zip(k_a.iter()) {
         *o ^= k;
@@ -80,7 +88,9 @@ pub fn account_unlock_key(
     iterations: u32,
 ) -> Result<SymmetricKey> {
     if alg != ALG_PBES2G_HS256 {
-        return Err(Error::Unsupported(format!("key derivation algorithm {alg:?}")));
+        return Err(Error::Unsupported(format!(
+            "key derivation algorithm {alg:?}"
+        )));
     }
     let k = two_secret_kdf(password, secret_key, email, alg, salt, iterations)?;
     Ok(SymmetricKey::new("mp", *k))
@@ -111,7 +121,10 @@ mod tests {
         // §8.2.2: "Å" in any encoding becomes U+0041 U+030A; surrounding whitespace is removed,
         // inner whitespace kept.
         for p in ["\u{212B}", "\u{00C5}", "A\u{030A}"] {
-            assert_eq!(normalize_password(&format!("  {p} x\t")).as_str(), "A\u{030A} x");
+            assert_eq!(
+                normalize_password(&format!("  {p} x\t")).as_str(),
+                "A\u{030A} x"
+            );
         }
     }
 
@@ -120,11 +133,43 @@ mod tests {
         let sk = SecretKey::parse("A3-8MMQJN-MZ64CY-2SDB4-RPX3T-V52Q3-N2C84").unwrap();
         let sk2 = SecretKey::parse("A3-8MMQJN-MZ64CY-2SDB4-RPX3T-V52Q3-N2C85").unwrap();
         let salt = [9u8; 16];
-        let a = two_secret_kdf("pw", &sk, "Patty@Dogs.Example", ALG_PBES2G_HS256, &salt, 100).unwrap();
-        let b = two_secret_kdf("pw", &sk, "patty@dogs.example", ALG_PBES2G_HS256, &salt, 100).unwrap();
+        let a = two_secret_kdf(
+            "pw",
+            &sk,
+            "Patty@Dogs.Example",
+            ALG_PBES2G_HS256,
+            &salt,
+            100,
+        )
+        .unwrap();
+        let b = two_secret_kdf(
+            "pw",
+            &sk,
+            "patty@dogs.example",
+            ALG_PBES2G_HS256,
+            &salt,
+            100,
+        )
+        .unwrap();
         assert_eq!(*a, *b, "email is case-insensitive");
-        let c = two_secret_kdf("pw2", &sk, "patty@dogs.example", ALG_PBES2G_HS256, &salt, 100).unwrap();
-        let d = two_secret_kdf("pw", &sk2, "patty@dogs.example", ALG_PBES2G_HS256, &salt, 100).unwrap();
+        let c = two_secret_kdf(
+            "pw2",
+            &sk,
+            "patty@dogs.example",
+            ALG_PBES2G_HS256,
+            &salt,
+            100,
+        )
+        .unwrap();
+        let d = two_secret_kdf(
+            "pw",
+            &sk2,
+            "patty@dogs.example",
+            ALG_PBES2G_HS256,
+            &salt,
+            100,
+        )
+        .unwrap();
         assert_ne!(*a, *c);
         assert_ne!(*a, *d);
     }

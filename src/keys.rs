@@ -47,18 +47,29 @@ impl EncryptedObject {
             return Err(Error::Unsupported(format!("encryption {:?}", self.enc)));
         }
         if self.kid != key.kid {
-            return Err(Error::Decrypt(format!("object is encrypted with key {:?}, not {:?}", self.kid, key.kid)));
+            return Err(Error::Decrypt(format!(
+                "object is encrypted with key {:?}, not {:?}",
+                self.kid, key.kid
+            )));
         }
         let iv = b64::decode(&self.iv)?;
         if iv.len() != 12 {
-            return Err(Error::Malformed(format!("GCM nonce is {} bytes, expected 12", iv.len())));
+            return Err(Error::Malformed(format!(
+                "GCM nonce is {} bytes, expected 12",
+                iv.len()
+            )));
         }
         let data = b64::decode(&self.data)?;
         let cipher = Aes256Gcm::new_from_slice(key.key.as_ref()).expect("32-byte key");
         cipher
             .decrypt(Nonce::from_slice(&iv), data.as_ref())
             .map(Zeroizing::new)
-            .map_err(|_| Error::Decrypt(format!("authentication failed for object encrypted with {:?}", self.kid)))
+            .map_err(|_| {
+                Error::Decrypt(format!(
+                    "authentication failed for object encrypted with {:?}",
+                    self.kid
+                ))
+            })
     }
 
     /// Decrypts and parses the plaintext as JSON.
@@ -72,7 +83,9 @@ impl EncryptedObject {
         let mut iv = [0u8; 12];
         rand::thread_rng().fill_bytes(&mut iv);
         let cipher = Aes256Gcm::new_from_slice(key.key.as_ref()).expect("32-byte key");
-        let data = cipher.encrypt(Nonce::from_slice(&iv), plaintext).expect("AES-GCM encryption cannot fail");
+        let data = cipher
+            .encrypt(Nonce::from_slice(&iv), plaintext)
+            .expect("AES-GCM encryption cannot fail");
         EncryptedObject {
             kid: key.kid.clone(),
             enc: "A256GCM".into(),
@@ -96,19 +109,28 @@ pub struct SymmetricKey {
 impl SymmetricKey {
     /// Wraps raw key bytes.
     pub fn new(kid: impl Into<String>, key: [u8; 32]) -> Self {
-        SymmetricKey { kid: kid.into(), key: Zeroizing::new(key) }
+        SymmetricKey {
+            kid: kid.into(),
+            key: Zeroizing::new(key),
+        }
     }
 
     /// Parses an `oct` JWK (`{"kty":"oct","alg":"A256GCM","k":…,"kid":…}`).
     pub fn from_jwk(jwk: &Jwk) -> Result<Self> {
         if jwk.kty != "oct" {
-            return Err(Error::Unsupported(format!("expected an oct JWK, got {:?}", jwk.kty)));
+            return Err(Error::Unsupported(format!(
+                "expected an oct JWK, got {:?}",
+                jwk.kty
+            )));
         }
-        let k = b64::decode(jwk.k.as_deref().ok_or_else(|| Error::Malformed("JWK without k".into()))?)?;
-        let key: [u8; 32] = k
-            .as_slice()
-            .try_into()
-            .map_err(|_| Error::Malformed(format!("symmetric key is {} bytes, expected 32", k.len())))?;
+        let k = b64::decode(
+            jwk.k
+                .as_deref()
+                .ok_or_else(|| Error::Malformed("JWK without k".into()))?,
+        )?;
+        let key: [u8; 32] = k.as_slice().try_into().map_err(|_| {
+            Error::Malformed(format!("symmetric key is {} bytes, expected 32", k.len()))
+        })?;
         Ok(SymmetricKey::new(jwk.kid.clone().unwrap_or_default(), key))
     }
 
@@ -172,7 +194,11 @@ impl Drop for Jwk {
 
 impl fmt::Debug for Jwk {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Jwk(kty={:?}, kid={:?}, alg={:?}, <key material redacted>)", self.kty, self.kid, self.alg)
+        write!(
+            f,
+            "Jwk(kty={:?}, kid={:?}, alg={:?}, <key material redacted>)",
+            self.kty, self.kid, self.alg
+        )
     }
 }
 
@@ -195,10 +221,15 @@ impl PrivateKey {
     /// Parses an RSA private JWK.
     pub fn from_jwk(jwk: &Jwk) -> Result<Self> {
         if jwk.kty != "RSA" {
-            return Err(Error::Unsupported(format!("expected an RSA JWK, got {:?}", jwk.kty)));
+            return Err(Error::Unsupported(format!(
+                "expected an RSA JWK, got {:?}",
+                jwk.kty
+            )));
         }
         let int = |name: &str, v: &Option<String>| -> Result<RsaBigUint> {
-            let s = v.as_deref().ok_or_else(|| Error::Malformed(format!("RSA JWK without {name}")))?;
+            let s = v
+                .as_deref()
+                .ok_or_else(|| Error::Malformed(format!("RSA JWK without {name}")))?;
             Ok(RsaBigUint::from_bytes_be(&b64::decode(s)?))
         };
         let key = RsaPrivateKey::from_components(
@@ -213,7 +244,11 @@ impl PrivateKey {
             Some("RSA-OAEP") => OaepHash::Sha1,
             Some(other) => return Err(Error::Unsupported(format!("RSA algorithm {other:?}"))),
         };
-        Ok(PrivateKey { kid: jwk.kid.clone().unwrap_or_default(), key, hash })
+        Ok(PrivateKey {
+            kid: jwk.kid.clone().unwrap_or_default(),
+            key,
+            hash,
+        })
     }
 
     /// The key ID.
@@ -227,23 +262,33 @@ impl PrivateKey {
             OaepHash::Sha256 => self.key.decrypt(Oaep::new::<sha2::Sha256>(), ciphertext),
             OaepHash::Sha1 => self.key.decrypt(Oaep::new::<sha1::Sha1>(), ciphertext),
         };
-        res.map(Zeroizing::new).map_err(|_| Error::Decrypt(format!("RSA-OAEP with key {:?}", self.kid)))
+        res.map(Zeroizing::new)
+            .map_err(|_| Error::Decrypt(format!("RSA-OAEP with key {:?}", self.kid)))
     }
 
     /// Decrypts an RSA-encrypted object (`enc` = `"RSA-OAEP"` / `"RSA-OAEP-256"`), as used for
     /// vault keys, and parses the plaintext as a JWK.
     pub fn decrypt_object_jwk(&self, obj: &EncryptedObject) -> Result<Jwk> {
         if obj.kid != self.kid {
-            return Err(Error::Decrypt(format!("object is encrypted with key {:?}, not {:?}", obj.kid, self.kid)));
+            return Err(Error::Decrypt(format!(
+                "object is encrypted with key {:?}, not {:?}",
+                obj.kid, self.kid
+            )));
         }
         let ct = b64::decode(&obj.data)?;
         // The object's `enc` says which OAEP hash was used; fall back to the key's own `alg`.
         let res = match obj.enc.as_str() {
             "RSA-OAEP-256" => self.key.decrypt(Oaep::new::<sha2::Sha256>(), &ct),
             "RSA-OAEP" => self.key.decrypt(Oaep::new::<sha1::Sha1>(), &ct),
-            other => return Err(Error::Unsupported(format!("vault key encryption {other:?}"))),
+            other => {
+                return Err(Error::Unsupported(format!(
+                    "vault key encryption {other:?}"
+                )));
+            }
         };
-        let plain = res.map(Zeroizing::new).map_err(|_| Error::Decrypt(format!("RSA-OAEP with key {:?}", self.kid)))?;
+        let plain = res
+            .map(Zeroizing::new)
+            .map_err(|_| Error::Decrypt(format!("RSA-OAEP with key {:?}", self.kid)))?;
         Ok(serde_json::from_slice(&plain)?)
     }
 }
@@ -315,7 +360,11 @@ impl EncryptedKeyset {
         if private.kid.is_empty() {
             private.kid = self.uuid.clone();
         }
-        Ok(Keyset { uuid: self.uuid.clone(), sym, private })
+        Ok(Keyset {
+            uuid: self.uuid.clone(),
+            sym,
+            private,
+        })
     }
 }
 
@@ -336,7 +385,9 @@ pub fn decrypt_keysets(sets: &[EncryptedKeyset], auk: &SymmetricKey) -> Result<V
             let result = if ks.encrypted_by == auk.kid() {
                 Some(ks.decrypt(auk))
             } else {
-                done.iter().find(|d| d.uuid == ks.encrypted_by).map(|by| ks.decrypt_with_keyset(by))
+                done.iter()
+                    .find(|d| d.uuid == ks.encrypted_by)
+                    .map(|by| ks.decrypt_with_keyset(by))
             };
             match result {
                 Some(Ok(k)) => {
@@ -352,7 +403,9 @@ pub fn decrypt_keysets(sets: &[EncryptedKeyset], auk: &SymmetricKey) -> Result<V
         }
         if pending.is_empty() || pending.len() == before {
             if done.is_empty() {
-                return Err(Error::Protocol("no keyset could be decrypted with the account password".into()));
+                return Err(Error::Protocol(
+                    "no keyset could be decrypted with the account password".into(),
+                ));
             }
             return Ok(done);
         }
@@ -381,9 +434,15 @@ mod tests {
                 "iv":"tYENu1VjK9bH7Ppn","data":"ajyndPzqt8mnc2R4x_ZGJSmRY6qqbOKKiEljvvNce1xtHNmc_jdbm5oBbQ=="}"#,
         )
         .unwrap();
-        let k: [u8; 32] = b64::decode("6fsZq-Md2jvAM7Bk8qLv0z59y68np5IxLK4RLgI_zog").unwrap().try_into().unwrap();
+        let k: [u8; 32] = b64::decode("6fsZq-Md2jvAM7Bk8qLv0z59y68np5IxLK4RLgI_zog")
+            .unwrap()
+            .try_into()
+            .unwrap();
         let key = SymmetricKey::new("YKQRP2M3HZFPZDNXTHQBYFPB5M", k);
-        assert_eq!(obj.decrypt(&key).unwrap().as_slice(), br#"{"users":[],"totalCount":0}"#);
+        assert_eq!(
+            obj.decrypt(&key).unwrap().as_slice(),
+            br#"{"users":[],"totalCount":0}"#
+        );
     }
 
     #[test]
@@ -427,7 +486,11 @@ mod tests {
         let ks = EncryptedKeyset {
             uuid: "ks1".into(),
             encrypted_by: "mp".into(),
-            enc_sym_key: EncryptedObject::encrypt(&auk, "b5+jwk+json", sym_jwk.to_string().as_bytes()),
+            enc_sym_key: EncryptedObject::encrypt(
+                &auk,
+                "b5+jwk+json",
+                sym_jwk.to_string().as_bytes(),
+            ),
             enc_pri_key: EncryptedObject::encrypt(&sym, "b5+jwk+json", pri.to_string().as_bytes()),
             pub_key: serde_json::Value::Null,
             sn: Some(1),
@@ -437,12 +500,22 @@ mod tests {
 
         // Vault key wrapped with RSA-OAEP-256, as for vault access.
         let vault_key = br#"{"kty":"oct","alg":"A256GCM","kid":"vault1","k":"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE"}"#;
-        let ct = rsa.to_public_key().encrypt(&mut rng, Oaep::new::<sha2::Sha256>(), vault_key).unwrap();
+        let ct = rsa
+            .to_public_key()
+            .encrypt(&mut rng, Oaep::new::<sha2::Sha256>(), vault_key)
+            .unwrap();
         let wrapped = EncryptedObject {
-            kid: "ks1".into(), enc: "RSA-OAEP-256".into(), cty: "b5+jwk+json".into(),
-            iv: String::new(), data: b64::encode(&ct), alg: None, p2s: None, p2c: None,
+            kid: "ks1".into(),
+            enc: "RSA-OAEP-256".into(),
+            cty: "b5+jwk+json".into(),
+            iv: String::new(),
+            data: b64::encode(&ct),
+            alg: None,
+            p2s: None,
+            p2c: None,
         };
-        let vk = SymmetricKey::from_jwk(&out[0].private.decrypt_object_jwk(&wrapped).unwrap()).unwrap();
+        let vk =
+            SymmetricKey::from_jwk(&out[0].private.decrypt_object_jwk(&wrapped).unwrap()).unwrap();
         assert_eq!(vk.kid(), "vault1");
         assert_eq!(vk.as_bytes(), &[1u8; 32]);
     }

@@ -1,7 +1,7 @@
 //! base64url helpers. 1Password objects use unpadded base64url, but be lenient on input.
 
-use base64::engine::general_purpose::{URL_SAFE_NO_PAD, STANDARD};
 use base64::Engine;
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 
 use crate::error::Result;
 

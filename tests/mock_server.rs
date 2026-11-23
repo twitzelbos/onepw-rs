@@ -4,14 +4,14 @@
 
 use std::sync::{Arc, Mutex};
 
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use num_bigint_dig::{BigUint, RandBigInt};
 use onepw::keys::{EncryptedObject, SymmetricKey};
-use onepw::{kdf, mac, srp, Account, Credentials, SecretKey, SignInOptions};
+use onepw::{Account, Credentials, SecretKey, SignInOptions, kdf, mac, srp};
 use rsa::traits::{PrivateKeyParts, PublicKeyParts};
 use rsa::{Oaep, RsaPrivateKey};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
@@ -29,7 +29,7 @@ fn unb64(s: &str) -> Vec<u8> {
     URL_SAFE_NO_PAD.decode(s.trim_end_matches('=')).unwrap()
 }
 fn pad(n: &BigUint, v: &BigUint) -> Vec<u8> {
-    let len = (n.bits() + 7) / 8;
+    let len = n.bits().div_ceil(8);
     let bytes = (v % n).to_bytes_be();
     let mut out = vec![0u8; len - bytes.len()];
     out.extend_from_slice(&bytes);
@@ -64,7 +64,9 @@ fn fixture() -> Fixture {
     let srp_salt = vec![5u8; 16];
     let x = kdf::srp_x(PASSWORD, &sk, EMAIL, "SRPg-4096", &srp_salt, 1000).unwrap();
     let group = srp::rfc5054_4096();
-    let verifier = group.g().modpow(&BigUint::from_bytes_be(x.as_ref()), group.n());
+    let verifier = group
+        .g()
+        .modpow(&BigUint::from_bytes_be(x.as_ref()), group.n());
 
     // Keyset: sym key encrypted by the AUK, RSA key encrypted by the sym key.
     let p2s = vec![6u8; 16];
@@ -76,7 +78,12 @@ fn fixture() -> Fixture {
     let pri_jwk = json!({"kty":"RSA","kid":ks_uuid,"alg":"RSA-OAEP-256","n":e(rsa.n()),"e":e(rsa.e()),
         "d":e(rsa.d()),"p":e(&rsa.primes()[0]),"q":e(&rsa.primes()[1])});
     let sym_jwk = json!({"kty":"oct","alg":"A256GCM","kid":ks_uuid,"k":b64(sym.as_bytes())});
-    let mut enc_sym = serde_json::to_value(EncryptedObject::encrypt(&auk, "b5+jwk+json", sym_jwk.to_string().as_bytes())).unwrap();
+    let mut enc_sym = serde_json::to_value(EncryptedObject::encrypt(
+        &auk,
+        "b5+jwk+json",
+        sym_jwk.to_string().as_bytes(),
+    ))
+    .unwrap();
     enc_sym["alg"] = "PBES2g-HS256".into();
     enc_sym["p2s"] = b64(&p2s).into();
     enc_sym["p2c"] = 1000.into();
@@ -89,7 +96,14 @@ fn fixture() -> Fixture {
     let g_pri_jwk = json!({"kty":"RSA","kid":g_uuid,"alg":"RSA-OAEP-256","n":e(g_rsa.n()),"e":e(g_rsa.e()),
         "d":e(g_rsa.d()),"p":e(&g_rsa.primes()[0]),"q":e(&g_rsa.primes()[1])});
     let g_sym_jwk = json!({"kty":"oct","alg":"A256GCM","kid":g_uuid,"k":b64(g_sym.as_bytes())});
-    let g_wrapped = rsa.to_public_key().encrypt(&mut rng, Oaep::new::<sha1::Sha1>(), g_sym_jwk.to_string().as_bytes()).unwrap();
+    let g_wrapped = rsa
+        .to_public_key()
+        .encrypt(
+            &mut rng,
+            Oaep::new::<sha1::Sha1>(),
+            g_sym_jwk.to_string().as_bytes(),
+        )
+        .unwrap();
     let keysets = json!({"keysets": [
         {"uuid": g_uuid, "encryptedBy": ks_uuid, "sn": 2,
          "encSymKey": {"kid": ks_uuid, "enc": "RSA-OAEP", "cty": "b5+jwk+json", "data": b64(&g_wrapped)},
@@ -99,14 +113,29 @@ fn fixture() -> Fixture {
          "encSymKey": enc_sym, "encPriKey": enc_pri, "pubKey": {"kty":"RSA","alg":"RSA-OAEP-256"}}
     ]});
     let shared_key = SymmetricKey::new("vk2", [5u8; 32]);
-    let shared_jwk = json!({"kty":"oct","alg":"A256GCM","kid":"vk2","k":b64(shared_key.as_bytes())});
-    let shared_wrapped = g_rsa.to_public_key().encrypt(&mut rng, Oaep::new::<sha2::Sha256>(), shared_jwk.to_string().as_bytes()).unwrap();
+    let shared_jwk =
+        json!({"kty":"oct","alg":"A256GCM","kid":"vk2","k":b64(shared_key.as_bytes())});
+    let shared_wrapped = g_rsa
+        .to_public_key()
+        .encrypt(
+            &mut rng,
+            Oaep::new::<sha2::Sha256>(),
+            shared_jwk.to_string().as_bytes(),
+        )
+        .unwrap();
 
     // Vault key wrapped with RSA-OAEP (SHA-1, as on older accounts) for the keyset.
     let vault_uuid = "p3nfd4jax622nqjos7licewuyn";
     let vault_key = SymmetricKey::new("vk1", [3u8; 32]);
     let vk_jwk = json!({"kty":"oct","alg":"A256GCM","kid":"vk1","k":b64(vault_key.as_bytes())});
-    let wrapped = rsa.to_public_key().encrypt(&mut rng, Oaep::new::<sha1::Sha1>(), vk_jwk.to_string().as_bytes()).unwrap();
+    let wrapped = rsa
+        .to_public_key()
+        .encrypt(
+            &mut rng,
+            Oaep::new::<sha1::Sha1>(),
+            vk_jwk.to_string().as_bytes(),
+        )
+        .unwrap();
     let account = json!({"vaults": [
         {"uuid": vault_uuid, "type": "P", "activeItemCount": 2,
          "encAttrs": EncryptedObject::encrypt(&vault_key, "b5+json", br#"{"name":"Private","desc":""}"#),
@@ -130,7 +159,13 @@ fn fixture() -> Fixture {
                                                {"designation":"password","name":"password","value":"hunter2"}]}), "N"),
         item("i3", "Old", json!({"password":"gone"}), "Y"),
     ]});
-    Fixture { verifier, srp_salt, keysets, account, items }
+    Fixture {
+        verifier,
+        srp_salt,
+        keysets,
+        account,
+        items,
+    }
 }
 
 struct Server {
@@ -147,30 +182,60 @@ impl Respond for Server {
 
 impl Server {
     fn key(&self) -> SymmetricKey {
-        SymmetricKey::new(SESSION_ID, self.state.lock().unwrap().session_key.expect("session key"))
+        SymmetricKey::new(
+            SESSION_ID,
+            self.state.lock().unwrap().session_key.expect("session key"),
+        )
     }
 
     /// Checks the MAC header the way the server does, and that request IDs increase.
     fn check_mac(&self, req: &Request) -> bool {
-        let Some(h) = req.headers.get("x-agilebits-mac").and_then(|v| v.to_str().ok()) else { return false };
-        let id: u32 = h.split('|').nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+        let Some(h) = req
+            .headers
+            .get("x-agilebits-mac")
+            .and_then(|v| v.to_str().ok())
+        else {
+            return false;
+        };
+        let id: u32 = h
+            .split('|')
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
         let mut st = self.state.lock().unwrap();
         // Like the real server, sign over the Host the client actually used.
         let mut url = req.url.clone();
-        let host = req.headers.get("host").and_then(|v| v.to_str().ok()).unwrap_or("localhost");
+        let host = req
+            .headers
+            .get("host")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("localhost");
         url.set_host(Some(host.split(':').next().unwrap())).unwrap();
-        let expected = mac::request_mac(&st.session_key.unwrap(), SESSION_ID, id, req.method.as_str(), &url);
+        let expected = mac::request_mac(
+            &st.session_key.unwrap(),
+            SESSION_ID,
+            id,
+            req.method.as_str(),
+            &url,
+        );
         let fresh = st.last_request_id.is_none_or(|last| id == last + 1);
         st.last_request_id = Some(id);
         st.macs_checked += 1;
         if h != expected || !fresh {
-            eprintln!("MAC mismatch: got {h}, expected {expected}, url {}, fresh {fresh}", req.url);
+            eprintln!(
+                "MAC mismatch: got {h}, expected {expected}, url {}, fresh {fresh}",
+                req.url
+            );
         }
         h == expected && fresh
     }
 
     fn encrypted(&self, v: &Value) -> ResponseTemplate {
-        ResponseTemplate::new(200).set_body_json(EncryptedObject::encrypt(&self.key(), "b5+jwk+json", v.to_string().as_bytes()))
+        ResponseTemplate::new(200).set_body_json(EncryptedObject::encrypt(
+            &self.key(),
+            "b5+jwk+json",
+            v.to_string().as_bytes(),
+        ))
     }
 }
 
@@ -180,7 +245,11 @@ fn auth_start(s: &Server, req: &Request) -> ResponseTemplate {
     assert_eq!(body["skFormat"], "A3");
     let mut st = s.state.lock().unwrap();
     st.starts += 1;
-    let status = if st.device_registered { "ok" } else { "device-not-registered" };
+    let status = if st.device_registered {
+        "ok"
+    } else {
+        "device-not-registered"
+    };
     ResponseTemplate::new(200).set_body_json(json!({
         "status": status, "sessionID": SESSION_ID, "accountKeyFormat": "A3", "accountKeyUuid": "8MMQJN",
         "userAuth": {"method": "SRPg-4096", "alg": "PBES2g-HS256", "iterations": 1000, "salt": b64(&s.fx.srp_salt)}
@@ -188,7 +257,10 @@ fn auth_start(s: &Server, req: &Request) -> ResponseTemplate {
 }
 
 fn device(s: &Server, req: &Request) -> ResponseTemplate {
-    assert_eq!(req.headers.get("x-agilebits-session-id").unwrap(), SESSION_ID);
+    assert_eq!(
+        req.headers.get("x-agilebits-session-id").unwrap(),
+        SESSION_ID
+    );
     let body: Value = serde_json::from_slice(&req.body).unwrap();
     assert_eq!(body["name"], "onepw");
     s.state.lock().unwrap().device_registered = true;
@@ -220,11 +292,20 @@ fn confirm_key(s: &Server, req: &Request) -> ResponseTemplate {
     let client_hash = unb64(body["clientVerifyHash"].as_str().unwrap());
     let g = srp::rfc5054_4096();
     let mut st = s.state.lock().unwrap();
-    let (a, b, k) = (st.big_a.clone().unwrap(), st.big_b.clone().unwrap(), st.session_key.unwrap());
+    let (a, b, k) = (
+        st.big_a.clone().unwrap(),
+        st.big_b.clone().unwrap(),
+        st.session_key.unwrap(),
+    );
     let hn = Sha256::digest(g.n().to_bytes_be());
     let hg = Sha256::digest(g.g().to_bytes_be());
     let mut m = Sha256::new();
-    m.update(hn.iter().zip(hg.iter()).map(|(x, y)| x ^ y).collect::<Vec<u8>>());
+    m.update(
+        hn.iter()
+            .zip(hg.iter())
+            .map(|(x, y)| x ^ y)
+            .collect::<Vec<u8>>(),
+    );
     // Server-side identity, written out independently of the client's srp::identity():
     // I = base64url(SHA256(SHA256(skid) ‖ SHA256(email))).
     let mut inner = Sha256::digest(b"8MMQJN").to_vec();
@@ -270,9 +351,25 @@ fn items(s: &Server, req: &Request) -> ResponseTemplate {
     s.encrypted(&s.fx.items)
 }
 
-async fn mount(server: &MockServer, m: &'static str, p: &str, regex: bool, state: &Arc<Mutex<State>>, fx: &Arc<Fixture>, handler: fn(&Server, &Request) -> ResponseTemplate) {
-    let responder = Server { state: state.clone(), fx: fx.clone(), handler };
-    let mock = if regex { Mock::given(method(m)).and(path_regex(p)) } else { Mock::given(method(m)).and(path(p)) };
+async fn mount(
+    server: &MockServer,
+    m: &'static str,
+    p: &str,
+    regex: bool,
+    state: &Arc<Mutex<State>>,
+    fx: &Arc<Fixture>,
+    handler: fn(&Server, &Request) -> ResponseTemplate,
+) {
+    let responder = Server {
+        state: state.clone(),
+        fx: fx.clone(),
+        handler,
+    };
+    let mock = if regex {
+        Mock::given(method(m)).and(path_regex(p))
+    } else {
+        Mock::given(method(m)).and(path(p))
+    };
     mock.respond_with(responder).mount(server).await;
 }
 
@@ -289,14 +386,86 @@ async fn setup() -> (MockServer, Arc<Mutex<State>>) {
     let server = MockServer::start().await;
     let state = Arc::new(Mutex::new(State::default()));
     let fx = Arc::new(fixture());
-    mount(&server, "POST", "/api/v3/auth/start", false, &state, &fx, auth_start).await;
-    mount(&server, "POST", "/api/v1/device", false, &state, &fx, device).await;
-    mount(&server, "POST", "/api/v2/auth", false, &state, &fx, srp_auth).await;
-    mount(&server, "POST", "/api/v2/auth/confirm-key", false, &state, &fx, confirm_key).await;
-    mount(&server, "POST", "/api/v2/auth/complete", false, &state, &fx, auth_complete).await;
-    mount(&server, "GET", "/api/v1/account/keysets", false, &state, &fx, keysets).await;
-    mount(&server, "GET", "/api/v1/account", false, &state, &fx, account).await;
-    mount(&server, "GET", r"^/api/v1/vault/[a-z0-9]+/0/items$", true, &state, &fx, items).await;
+    mount(
+        &server,
+        "POST",
+        "/api/v3/auth/start",
+        false,
+        &state,
+        &fx,
+        auth_start,
+    )
+    .await;
+    mount(
+        &server,
+        "POST",
+        "/api/v1/device",
+        false,
+        &state,
+        &fx,
+        device,
+    )
+    .await;
+    mount(
+        &server,
+        "POST",
+        "/api/v2/auth",
+        false,
+        &state,
+        &fx,
+        srp_auth,
+    )
+    .await;
+    mount(
+        &server,
+        "POST",
+        "/api/v2/auth/confirm-key",
+        false,
+        &state,
+        &fx,
+        confirm_key,
+    )
+    .await;
+    mount(
+        &server,
+        "POST",
+        "/api/v2/auth/complete",
+        false,
+        &state,
+        &fx,
+        auth_complete,
+    )
+    .await;
+    mount(
+        &server,
+        "GET",
+        "/api/v1/account/keysets",
+        false,
+        &state,
+        &fx,
+        keysets,
+    )
+    .await;
+    mount(
+        &server,
+        "GET",
+        "/api/v1/account",
+        false,
+        &state,
+        &fx,
+        account,
+    )
+    .await;
+    mount(
+        &server,
+        "GET",
+        r"^/api/v1/vault/[a-z0-9]+/0/items$",
+        true,
+        &state,
+        &fx,
+        items,
+    )
+    .await;
     (server, state)
 }
 
@@ -309,7 +478,9 @@ fn opts(server: &MockServer) -> SignInOptions {
 #[tokio::test]
 async fn full_sign_in_and_read() {
     let (server, state) = setup().await;
-    let account = Account::sign_in(&creds(PASSWORD), opts(&server)).await.expect("sign in");
+    let account = Account::sign_in(&creds(PASSWORD), opts(&server))
+        .await
+        .expect("sign in");
     assert_eq!(account.user_uuid(), Some("USER1"));
     {
         let st = state.lock().unwrap();
@@ -321,7 +492,11 @@ async fn full_sign_in_and_read() {
     let vaults = account.vaults().await.unwrap();
     assert_eq!(vaults.len(), 2, "vault without read ACL is skipped");
     assert_eq!(vaults[0].name(), "Private");
-    assert_eq!(vaults[1].name(), "Shared", "vault reached through an RSA-wrapped group keyset");
+    assert_eq!(
+        vaults[1].name(),
+        "Shared",
+        "vault reached through an RSA-wrapped group keyset"
+    );
 
     let items = account.items(&vaults[0]).await.unwrap();
     assert_eq!(items.len(), 3);
@@ -329,9 +504,15 @@ async fn full_sign_in_and_read() {
     assert_eq!(gh.field("username"), Some("patty"));
     assert_eq!(gh.field("password"), Some("hunter2"));
 
-    let key = account.read("op://Private/Anthropic API/credential").await.unwrap();
+    let key = account
+        .read("op://Private/Anthropic API/credential")
+        .await
+        .unwrap();
     assert_eq!(key.as_str(), "sk-test-123");
-    assert!(account.read("op://Private/Old/password").await.is_err(), "trashed items are not resolved");
+    assert!(
+        account.read("op://Private/Old/password").await.is_err(),
+        "trashed items are not resolved"
+    );
 
     assert!(state.lock().unwrap().macs_checked >= 6);
 }
@@ -339,6 +520,12 @@ async fn full_sign_in_and_read() {
 #[tokio::test]
 async fn wrong_password_is_reported() {
     let (server, _state) = setup().await;
-    let err = Account::sign_in(&creds("wrong password"), opts(&server)).await.unwrap_err();
-    assert!(err.to_string().contains("wrong account password or Secret Key"), "{err}");
+    let err = Account::sign_in(&creds("wrong password"), opts(&server))
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("wrong account password or Secret Key"),
+        "{err}"
+    );
 }

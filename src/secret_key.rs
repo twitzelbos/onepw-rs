@@ -28,11 +28,16 @@ impl SecretKey {
     /// Parses a Secret Key, ignoring case, hyphens and whitespace.
     pub fn parse(input: &str) -> Result<Self> {
         let clean: Zeroizing<String> = Zeroizing::new(
-            input.chars().filter(|c| *c != '-' && !c.is_whitespace()).collect::<String>().to_ascii_uppercase(),
+            input
+                .chars()
+                .filter(|c| *c != '-' && !c.is_whitespace())
+                .collect::<String>()
+                .to_ascii_uppercase(),
         );
         if !clean.starts_with("A3") {
             return Err(Error::Unsupported(
-                "Secret Key format (only A3 keys are supported; the key should start with \"A3-\")".into(),
+                "Secret Key format (only A3 keys are supported; the key should start with \"A3-\")"
+                    .into(),
             ));
         }
         if clean.len() != 2 + ACCOUNT_ID_LEN + SECRET_LEN {
@@ -80,7 +85,11 @@ impl FromStr for SecretKey {
 
 impl fmt::Debug for SecretKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "SecretKey({}-{}-<redacted>)", self.format, self.account_id)
+        write!(
+            f,
+            "SecretKey({}-{}-<redacted>)",
+            self.format, self.account_id
+        )
     }
 }
 
