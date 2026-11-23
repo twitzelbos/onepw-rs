@@ -1,4 +1,5 @@
-//! Touch ID unlock on macOS (feature `touchid`).
+//! **macOS only.** Touch ID unlock (feature `touchid`). This module doesn't exist on other
+//! platforms; enabling the feature there is a no-op.
 //!
 //! After one sign-in with the password, the [`UnlockKeys`] (SRP `x` and the Account Unlock Key, not
 //! the password) are stored in the macOS Keychain behind Touch ID. Later sign-ins use

@@ -80,7 +80,8 @@ enum AccountCmd {
     Show,
     /// Forget the account (config file and keychain entries).
     Forget,
-    /// Unlock with Touch ID instead of the password (macOS): `on` or `off`.
+    /// (macOS only) Unlock with Touch ID instead of the password: `on` or `off`.
+    #[cfg_attr(not(target_os = "macos"), command(hide = true))]
     TouchId {
         /// `on` or `off`.
         #[arg(value_parser = ["on", "off"])]
@@ -440,7 +441,7 @@ async fn run(cli: Cli) -> Result<i32, String> {
             #[cfg(not(all(feature = "touchid", target_os = "macos")))]
             {
                 let _ = (&mut cfg, state);
-                return Err("this build has no Touch ID support (macOS, feature `touchid`)".into());
+                return Err("Touch ID unlock is macOS only".into());
             }
         }
         Cmd::Vault(VaultCmd::List) => {

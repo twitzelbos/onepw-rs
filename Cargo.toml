@@ -13,6 +13,8 @@ exclude = ["/.github"]
 
 [package.metadata.docs.rs]
 all-features = true
+# Also document the macOS build, which is the only one with `onepw::touchid`.
+targets = ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
@@ -56,7 +58,8 @@ zeroize = "1.9.2"
 [features]
 ## The `onepw` command-line tool: `cargo install onepw --features cli`
 cli = ["dep:clap", "dep:rpassword", "dep:tokio", "dep:keyring", "dep:dirs", "touchid"]
-## macOS: unlock with Touch ID instead of the password (see `onepw::touchid`)
+## macOS ONLY: unlock with Touch ID instead of the password (`onepw::touchid`).
+## On other platforms this feature compiles to nothing and pulls in no dependencies.
 touchid = [
     "dep:objc2",
     "dep:objc2-foundation",

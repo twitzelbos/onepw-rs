@@ -73,6 +73,14 @@ cargo run --example try_account
 
 It prompts for the sign-in address, email, Secret Key and password (the last two hidden) and, if needed, a 2FA code. It then lists your vaults with item counts. It never prints secrets. The device UUID is saved in `~/.config/onepw/device-uuid`.
 
+## Cargo features
+
+| Feature | Platforms | What it adds |
+|---|---|---|
+| *(none)* | all | The library: sign-in, vaults, items, `op://` references |
+| `cli` | all | The `onepw` binary. Its `account touch-id` command is macOS only, and hidden elsewhere |
+| `touchid` | **macOS only** | `onepw::touchid`: unlock with Touch ID instead of the password. On Linux and Windows it compiles to nothing and pulls in no dependencies, so it's safe to leave on in cross-platform builds. Docs: [macOS build on docs.rs](https://docs.rs/onepw/latest/aarch64-apple-darwin/onepw/touchid/) |
+
 ## Command-line tool
 
 ```sh
@@ -87,10 +95,12 @@ onepw item get GitHub [--reveal] [--json]  # concealed values hidden unless --re
 onepw read op://Private/GitHub/password    # like `op read`; -n for no trailing newline
 onepw run --env-file .env.op -- cargo run  # like `op run`: op:// values in the env/env file are resolved
 onepw account show | forget
+onepw account touch-id on | off            # macOS only: Touch ID instead of the password
 ```
 
 - **Secret Key:** stored in the macOS Keychain (or the Linux kernel keyring) under the service `onepw`. Settings (address, email, device ID) go in `~/.config/onepw/config.json`. You can also set `ONEPW_SECRET_KEY`.
 - **Account password:** **never stored**. It's asked for (hidden) on every command, or read from `ONEPW_PASSWORD`. Keeping it next to the Secret Key would undo 1Password's two-secret design.
+- **Touch ID (macOS only):** `onepw account touch-id on` asks for the password once, then stores the *derived* unlock keys (not the password) in the Keychain behind Touch ID. Builds signed with a Developer ID and the right entitlement get a Secure Enclave-enforced item. Others get an item that only onepw reads, after its own Touch ID check. A cancelled prompt or out-of-date keys fall back to the password.
 - **`run`:** every environment variable, from your shell or from `--env-file` lines `KEY=op://vault/item/field`, whose value starts with `op://` is replaced before the command starts. The command's exit code is passed through.
 - **Cost:** each command is a full sign-in (≈1 s, mostly the 650 000-round key derivation). `run` resolves all references with one sign-in.
 
