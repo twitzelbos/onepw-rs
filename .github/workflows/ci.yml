@@ -11,9 +11,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
-      - run: cargo test --all-targets
+      - run: cargo test --all-targets --features cli
       - run: cargo test --doc
-      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --all-targets --features cli -- -D warnings
       - run: cargo doc --no-deps
         env:
           RUSTDOCFLAGS: -D warnings

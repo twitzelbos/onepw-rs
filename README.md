@@ -73,6 +73,27 @@ cargo run --example try_account
 
 It prompts for the sign-in address, email, Secret Key and password (the last two hidden) and, if needed, a 2FA code. It then lists your vaults with item counts. It never prints secrets. The device UUID is saved in `~/.config/onepw/device-uuid`.
 
+## Command-line tool
+
+```sh
+cargo install onepw --features cli
+```
+
+```sh
+onepw account add                          # one-time: address, email, Secret Key (→ OS keychain); checks sign-in
+onepw vault list
+onepw item list [--vault Private]
+onepw item get GitHub [--reveal] [--json]  # concealed values hidden unless --reveal
+onepw read op://Private/GitHub/password    # like `op read`; -n for no trailing newline
+onepw run --env-file .env.op -- cargo run  # like `op run`: op:// values in the env/env file are resolved
+onepw account show | forget
+```
+
+- **Secret Key:** stored in the macOS Keychain (or the Linux kernel keyring) under the service `onepw`. Settings (address, email, device ID) go in `~/.config/onepw/config.json`. You can also set `ONEPW_SECRET_KEY`.
+- **Account password:** **never stored**. It's asked for (hidden) on every command, or read from `ONEPW_PASSWORD`. Keeping it next to the Secret Key would undo 1Password's two-secret design.
+- **`run`:** every environment variable, from your shell or from `--env-file` lines `KEY=op://vault/item/field`, whose value starts with `op://` is replaced before the command starts. The command's exit code is passed through.
+- **Cost:** each command is a full sign-in (≈1 s, mostly the 650 000-round key derivation). `run` resolves all references with one sign-in.
+
 ## Manual
 
 ### Credentials

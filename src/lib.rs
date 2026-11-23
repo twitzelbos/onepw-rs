@@ -11,7 +11,9 @@ pub mod mac;
 pub mod secret_key;
 pub mod srp;
 
-pub use client::{Account, ClientIdentity, Credentials, Item, SignInOptions, Vault};
+pub use client::{
+    Account, ClientIdentity, Credentials, Field, Item, SecretReference, SignInOptions, Vault,
+};
 pub use secret_key::SecretKey;
 
 pub use error::{Error, Result};

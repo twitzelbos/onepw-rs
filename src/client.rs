@@ -185,7 +185,104 @@ pub struct Item {
     pub details: Value,
 }
 
+/// One field of an item, flattened from the top-level `fields` and the `sections`.
+#[derive(Clone, Debug)]
+pub struct Field {
+    /// Section title, if the field is in a section.
+    pub section: Option<String>,
+    /// Field label (`"username"`, `"password"`, `"credential"`, a custom label, …).
+    pub label: String,
+    /// The value.
+    pub value: String,
+    /// Whether 1Password treats it as secret (password / concealed fields).
+    pub concealed: bool,
+}
+
 impl Item {
+    /// All fields with a non-empty value, top-level fields first, then section fields.
+    pub fn fields(&self) -> Vec<Field> {
+        let d = &self.details;
+        let s = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+        let mut out = Vec::new();
+        for f in d
+            .get("fields")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let label = Some(s(f, "designation"))
+                .filter(|x| !x.is_empty())
+                .unwrap_or_else(|| s(f, "name"));
+            out.push(Field {
+                section: None,
+                concealed: s(f, "type") == "P" || label == "password",
+                label,
+                value: s(f, "value"),
+            });
+        }
+        if let Some(p) = d.get("password").and_then(Value::as_str) {
+            if !out.iter().any(|f| f.label == "password") {
+                out.push(Field {
+                    section: None,
+                    label: "password".into(),
+                    value: p.into(),
+                    concealed: true,
+                });
+            }
+        }
+        for sec in d
+            .get("sections")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let title = Some(s(sec, "title")).filter(|x| !x.is_empty());
+            for f in sec
+                .get("fields")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let label = Some(s(f, "t"))
+                    .filter(|x| !x.is_empty())
+                    .unwrap_or_else(|| s(f, "n"));
+                out.push(Field {
+                    section: title.clone(),
+                    concealed: s(f, "k") == "concealed",
+                    label,
+                    value: f
+                        .get("v")
+                        .map(|v| {
+                            v.as_str()
+                                .map(str::to_owned)
+                                .unwrap_or_else(|| v.to_string())
+                        })
+                        .unwrap_or_default(),
+                });
+            }
+        }
+        out.retain(|f| !f.value.is_empty());
+        out
+    }
+
+    /// The item's URLs (from the overview).
+    pub fn urls(&self) -> Vec<&str> {
+        let mut v: Vec<&str> = self
+            .overview
+            .get("URLs")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|u| u.get("u").and_then(Value::as_str))
+            .collect();
+        if v.is_empty() {
+            if let Some(u) = self.overview.get("url").and_then(Value::as_str) {
+                v.push(u);
+            }
+        }
+        v
+    }
+
     /// The item's title.
     pub fn title(&self) -> &str {
         self.overview
@@ -484,35 +581,11 @@ impl Account {
     /// # Ok(()) }
     /// ```
     pub async fn read(&self, reference: &str) -> Result<Zeroizing<String>> {
-        let rest = reference
-            .strip_prefix("op://")
-            .ok_or_else(|| Error::InvalidInput("reference must start with op://".into()))?;
-        let parts: Vec<&str> = rest.split('/').collect();
-        let [vault_ref, item_ref, field] = parts[..] else {
-            return Err(Error::InvalidInput(
-                "expected op://<vault>/<item>/<field>".into(),
-            ));
-        };
+        let r = SecretReference::parse(reference)?;
         let vaults = self.vaults().await?;
-        let vault = vaults
-            .iter()
-            .find(|v| {
-                v.uuid == vault_ref
-                    || v.name() == vault_ref
-                    || (vault_ref == "Private" && v.vault_type == "P")
-            })
-            .ok_or_else(|| Error::InvalidInput(format!("no readable vault {vault_ref:?}")))?;
+        let vault = r.find_vault(&vaults)?;
         let items = self.items(vault).await?;
-        let item = items
-            .iter()
-            .filter(|i| !i.trashed)
-            .find(|i| i.uuid == item_ref || i.title() == item_ref)
-            .ok_or_else(|| {
-                Error::InvalidInput(format!("no item {item_ref:?} in vault {vault_ref:?}"))
-            })?;
-        item.field(field)
-            .map(|v| Zeroizing::new(v.to_string()))
-            .ok_or_else(|| Error::InvalidInput(format!("item {item_ref:?} has no field {field:?}")))
+        r.resolve_in(&items)
     }
 
     /// Ends the session on the server.
@@ -817,4 +890,73 @@ struct RawItem {
     trashed: Option<String>,
     enc_overview: EncryptedObject,
     enc_details: Option<EncryptedObject>,
+}
+
+/// A parsed secret reference `op://<vault>/<item>/<field>`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SecretReference {
+    /// Vault name or UUID (`"Private"` also matches the personal vault).
+    pub vault: String,
+    /// Item title or UUID.
+    pub item: String,
+    /// Field label or designation.
+    pub field: String,
+}
+
+impl SecretReference {
+    /// Parses `op://vault/item/field`.
+    ///
+    /// ```
+    /// let r = onepw::SecretReference::parse("op://Private/Anthropic API/credential")?;
+    /// assert_eq!((r.vault.as_str(), r.item.as_str(), r.field.as_str()), ("Private", "Anthropic API", "credential"));
+    /// # Ok::<(), onepw::Error>(())
+    /// ```
+    pub fn parse(reference: &str) -> Result<Self> {
+        let rest = reference.trim().strip_prefix("op://").ok_or_else(|| {
+            Error::InvalidInput(format!("{reference:?} doesn't start with op://"))
+        })?;
+        let parts: Vec<&str> = rest.split('/').collect();
+        match parts[..] {
+            [v, i, f] if !v.is_empty() && !i.is_empty() && !f.is_empty() => Ok(SecretReference {
+                vault: v.into(),
+                item: i.into(),
+                field: f.into(),
+            }),
+            _ => Err(Error::InvalidInput(format!(
+                "{reference:?}: expected op://<vault>/<item>/<field>"
+            ))),
+        }
+    }
+
+    /// Picks the vault this reference points to.
+    pub fn find_vault<'a>(&self, vaults: &'a [Vault]) -> Result<&'a Vault> {
+        vaults
+            .iter()
+            .find(|v| v.uuid == self.vault || v.name() == self.vault)
+            .or_else(|| {
+                (self.vault == "Private")
+                    .then(|| vaults.iter().find(|v| v.vault_type == "P"))
+                    .flatten()
+            })
+            .ok_or_else(|| Error::InvalidInput(format!("no readable vault {:?}", self.vault)))
+    }
+
+    /// Resolves the reference among a vault's items (trashed items are ignored).
+    pub fn resolve_in(&self, items: &[Item]) -> Result<Zeroizing<String>> {
+        let item = items
+            .iter()
+            .filter(|i| !i.trashed)
+            .find(|i| i.uuid == self.item || i.title() == self.item)
+            .ok_or_else(|| {
+                Error::InvalidInput(format!("no item {:?} in vault {:?}", self.item, self.vault))
+            })?;
+        item.field(&self.field)
+            .map(|v| Zeroizing::new(v.to_string()))
+            .ok_or_else(|| {
+                Error::InvalidInput(format!(
+                    "item {:?} has no field {:?}",
+                    self.item, self.field
+                ))
+            })
+    }
 }
