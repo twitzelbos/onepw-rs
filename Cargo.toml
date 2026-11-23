@@ -55,9 +55,29 @@ zeroize = "1.9.2"
 
 [features]
 ## The `onepw` command-line tool: `cargo install onepw --features cli`
-cli = ["dep:clap", "dep:rpassword", "dep:tokio", "dep:keyring", "dep:dirs"]
+cli = ["dep:clap", "dep:rpassword", "dep:tokio", "dep:keyring", "dep:dirs", "touchid"]
+## macOS: unlock with Touch ID instead of the password (see `onepw::touchid`)
+touchid = [
+    "dep:objc2",
+    "dep:objc2-foundation",
+    "dep:objc2-local-authentication",
+    "dep:block2",
+    "dep:security-framework",
+]
+objc2-local-authentication = ["dep:objc2-local-authentication"]
+objc2 = ["dep:objc2"]
+objc2-foundation = ["dep:objc2-foundation"]
+block2 = ["dep:block2"]
+security-framework = ["dep:security-framework"]
 
 [[bin]]
 name = "onepw"
 path = "src/bin/onepw.rs"
 required-features = ["cli"]
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = { version = "0.6.2", optional = true }
+objc2 = { version = "0.6.5", optional = true }
+objc2-foundation = { version = "0.3.2", optional = true, default-features = false, features = ["std", "NSString", "NSError"] }
+objc2-local-authentication = { version = "0.3.2", optional = true, default-features = false, features = ["std", "block2", "LAContext"] }
+security-framework = { version = "3.7.0", optional = true, features = ["OSX_10_15"] }

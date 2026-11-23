@@ -137,6 +137,7 @@ pub struct Account {
     rest: Rest,
     keysets: Vec<Keyset>,
     user_uuid: Option<String>,
+    unlock_keys: UnlockKeys,
 }
 
 impl std::fmt::Debug for Account {
@@ -146,6 +147,56 @@ impl std::fmt::Debug for Account {
             .field("keysets", &self.keysets.len())
             .finish()
     }
+}
+
+/// The two keys derived from the account password and Secret Key: the SRP secret `x` and the
+/// Account Unlock Key. Together they can sign in to **this** account and unlock its keys without
+/// the password, so treat them like the password itself. They're useless for any other account
+/// and become invalid when the password or Secret Key changes.
+///
+/// This is what a Touch ID unlock stores (see the `touchid` feature), the same way 1Password's own
+/// apps avoid keeping your password.
+#[derive(Clone)]
+pub struct UnlockKeys {
+    srp_x: Zeroizing<[u8; 32]>,
+    auk: Zeroizing<[u8; 32]>,
+}
+
+impl UnlockKeys {
+    /// Serializes to 64 bytes (`x ‖ AUK`) for storage.
+    pub fn to_bytes(&self) -> Zeroizing<[u8; 64]> {
+        let mut out = Zeroizing::new([0u8; 64]);
+        out[..32].copy_from_slice(self.srp_x.as_ref());
+        out[32..].copy_from_slice(self.auk.as_ref());
+        out
+    }
+
+    /// Restores keys stored with [`UnlockKeys::to_bytes`].
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        if bytes.len() != 64 {
+            return Err(Error::Malformed(format!(
+                "unlock keys are {} bytes, expected 64",
+                bytes.len()
+            )));
+        }
+        let mut srp_x = Zeroizing::new([0u8; 32]);
+        let mut auk = Zeroizing::new([0u8; 32]);
+        srp_x.copy_from_slice(&bytes[..32]);
+        auk.copy_from_slice(&bytes[32..]);
+        Ok(UnlockKeys { srp_x, auk })
+    }
+}
+
+impl std::fmt::Debug for UnlockKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("UnlockKeys(<redacted>)")
+    }
+}
+
+/// How to prove knowledge of the account password.
+enum Secret<'a> {
+    Password(&'a str),
+    Keys(&'a UnlockKeys),
 }
 
 /// A vault you can read.
@@ -375,20 +426,58 @@ impl Account {
     /// account), [`Error::Unsupported`] for 2FA methods other than an authenticator app,
     /// [`Error::Protocol`] if the server fails its half of the SRP proof.
     pub async fn sign_in(creds: &Credentials, opts: SignInOptions) -> Result<Account> {
+        Self::sign_in_impl(
+            &creds.email,
+            &creds.sign_in_address,
+            &creds.secret_key,
+            Secret::Password(&creds.password),
+            opts,
+        )
+        .await
+    }
+
+    /// Signs in with previously saved [`UnlockKeys`] instead of the password (see
+    /// [`Account::unlock_keys`]). The Secret Key is still needed to identify the account.
+    ///
+    /// Fails with [`Error::InvalidInput`] "stored unlock keys are out of date" after a password or
+    /// Secret Key change; sign in with the password again and save the new keys.
+    pub async fn sign_in_with_keys(
+        email: &str,
+        sign_in_address: &str,
+        secret_key: &SecretKey,
+        keys: &UnlockKeys,
+        opts: SignInOptions,
+    ) -> Result<Account> {
+        Self::sign_in_impl(email, sign_in_address, secret_key, Secret::Keys(keys), opts).await
+    }
+
+    /// The keys derived during this sign-in, for saving behind Touch ID (or another protected
+    /// store) and passing to [`Account::sign_in_with_keys`] later.
+    pub fn unlock_keys(&self) -> &UnlockKeys {
+        &self.unlock_keys
+    }
+
+    async fn sign_in_impl(
+        email: &str,
+        sign_in_address: &str,
+        sk: &SecretKey,
+        secret: Secret<'_>,
+        opts: SignInOptions,
+    ) -> Result<Account> {
+        let stale = || {
+            Error::InvalidInput("stored unlock keys are out of date (password or Secret Key changed?): sign in with the password again".into())
+        };
+        let creds = (email, sign_in_address);
         let base = match &opts.base_url {
             Some(u) => u.clone(),
-            None => Url::parse(&format!(
-                "https://{}/api/",
-                creds.sign_in_address.trim_end_matches('/')
-            ))
-            .map_err(|e| Error::InvalidInput(format!("sign-in address: {e}")))?,
+            None => Url::parse(&format!("https://{}/api/", creds.1.trim_end_matches('/')))
+                .map_err(|e| Error::InvalidInput(format!("sign-in address: {e}")))?,
         };
         let http = reqwest::Client::builder().build()?;
         let mut rest = Rest::new(http, base, &opts.identity, &opts.device_uuid);
-        let sk = &creds.secret_key;
 
         // 1. Start the session (registering the device if needed).
-        let start = start_session(&mut rest, creds, &opts).await?;
+        let start = start_session(&mut rest, creds.0, sk, &opts).await?;
         if start.account_key_format.as_deref() != Some(sk.format())
             || start.account_key_uuid.as_deref() != Some(sk.account_id())
         {
@@ -401,14 +490,12 @@ impl Account {
 
         // 2. SRP: A → B.
         let salt = b64::decode(&auth.salt)?;
-        let x = kdf::srp_x(
-            &creds.password,
-            sk,
-            &creds.email,
-            &auth.method,
-            &salt,
-            auth.iterations,
-        )?;
+        let x = match secret {
+            Secret::Password(pw) => {
+                kdf::srp_x(pw, sk, creds.0, &auth.method, &salt, auth.iterations)?
+            }
+            Secret::Keys(k) => k.srp_x.clone(),
+        };
         let client = srp::Client::new_standard(srp::Group::for_method(&auth.method)?, x.as_ref());
         let resp: Value = rest
             .post_plain("v2/auth", &json!({"userA": client.public_a_hex()}))
@@ -421,7 +508,7 @@ impl Account {
         let key = client.session_key(&big_b)?;
 
         // 3. Mutual proof.
-        let identity = srp::identity(&creds.email, sk.account_id());
+        let identity = srp::identity(creds.0, sk.account_id());
         let m1 = client.client_proof(&big_b, &key, &identity, &salt);
         let resp: Value = match rest
             .post_plain(
@@ -431,9 +518,12 @@ impl Account {
             .await
         {
             Err(Error::Server { status: 401, .. }) => {
-                return Err(Error::InvalidInput(
-                    "wrong account password or Secret Key".into(),
-                ));
+                return Err(match secret {
+                    Secret::Keys(_) => stale(),
+                    Secret::Password(_) => {
+                        Error::InvalidInput("wrong account password or Secret Key".into())
+                    }
+                });
             }
             other => other?,
         };
@@ -470,24 +560,35 @@ impl Account {
             .max_by_key(|k| k.sn.unwrap_or(0))
             .ok_or_else(|| Error::Protocol("no keyset encrypted by the account password".into()))?;
         let esk = &primary.enc_sym_key;
-        let auk = kdf::account_unlock_key(
-            &creds.password,
-            sk,
-            &creds.email,
-            esk.alg.as_deref().unwrap_or(kdf::ALG_PBES2G_HS256),
-            &b64::decode(
-                esk.p2s
-                    .as_deref()
-                    .ok_or_else(|| Error::Malformed("encSymKey without p2s".into()))?,
+        let auk = match secret {
+            Secret::Password(pw) => kdf::account_unlock_key(
+                pw,
+                sk,
+                creds.0,
+                esk.alg.as_deref().unwrap_or(kdf::ALG_PBES2G_HS256),
+                &b64::decode(
+                    esk.p2s
+                        .as_deref()
+                        .ok_or_else(|| Error::Malformed("encSymKey without p2s".into()))?,
+                )?,
+                esk.p2c
+                    .ok_or_else(|| Error::Malformed("encSymKey without p2c".into()))?,
             )?,
-            esk.p2c
-                .ok_or_else(|| Error::Malformed("encSymKey without p2c".into()))?,
-        )?;
-        let keysets = decrypt_keysets(&ks.keysets, &auk)?;
+            Secret::Keys(k) => SymmetricKey::new("mp", *k.auk),
+        };
+        let keysets = match decrypt_keysets(&ks.keysets, &auk) {
+            Err(Error::Decrypt(_)) if matches!(secret, Secret::Keys(_)) => return Err(stale()),
+            other => other?,
+        };
+        let unlock_keys = UnlockKeys {
+            srp_x: x,
+            auk: Zeroizing::new(*auk.as_bytes()),
+        };
         Ok(Account {
             rest,
             keysets,
             user_uuid,
+            unlock_keys,
         })
     }
 
@@ -604,16 +705,16 @@ impl Account {
 
 async fn start_session(
     rest: &mut Rest,
-    creds: &Credentials,
+    email: &str,
+    sk: &SecretKey,
     opts: &SignInOptions,
 ) -> Result<StartResponse> {
-    let sk = &creds.secret_key;
     for _ in 0..3 {
         let start: StartResponse = rest
             .post_plain(
                 "v3/auth/start",
                 &json!({
-                    "email": creds.email.trim(),
+                    "email": email.trim(),
                     "skFormat": sk.format(),
                     "skid": sk.account_id(),
                     "deviceUuid": opts.device_uuid,

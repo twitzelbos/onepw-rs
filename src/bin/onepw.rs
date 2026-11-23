@@ -78,8 +78,14 @@ enum AccountCmd {
     },
     /// Show the configured account.
     Show,
-    /// Forget the account (config file and keychain entry).
+    /// Forget the account (config file and keychain entries).
     Forget,
+    /// Unlock with Touch ID instead of the password (macOS): `on` or `off`.
+    TouchId {
+        /// `on` or `off`.
+        #[arg(value_parser = ["on", "off"])]
+        state: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -120,6 +126,20 @@ struct Config {
     address: String,
     email: String,
     device_uuid: String,
+    /// Unlock with Touch ID (macOS) instead of the password.
+    #[serde(default)]
+    touch_id: bool,
+}
+
+impl Config {
+    fn label(&self) -> String {
+        format!("{}@{}", self.email, self.address)
+    }
+    fn save(&self) -> Result<(), String> {
+        let p = config_path();
+        std::fs::create_dir_all(p.parent().unwrap()).map_err(|e| e.to_string())?;
+        std::fs::write(&p, serde_json::to_string_pretty(self).unwrap()).map_err(|e| e.to_string())
+    }
 }
 
 fn config_path() -> PathBuf {
@@ -181,6 +201,13 @@ fn options(device_uuid: String) -> SignInOptions {
 
 async fn sign_in() -> Result<Account, String> {
     let cfg = load_config()?;
+    sign_in_with(&cfg, false).await
+}
+
+/// Signs in with Touch ID when enabled (unless `force_password`), else with the password. After a
+/// password sign-in with Touch ID enabled, the stored keys are refreshed (e.g. after a password
+/// change).
+async fn sign_in_with(cfg: &Config, force_password: bool) -> Result<Account, String> {
     let sk =
         match std::env::var("ONEPW_SECRET_KEY") {
             Ok(s) => Zeroizing::new(s),
@@ -188,15 +215,44 @@ async fn sign_in() -> Result<Account, String> {
                 |e| format!("Secret Key not in keychain ({e}): run `onepw account add`"),
             )?),
         };
+    let secret_key = SecretKey::parse(&sk).map_err(|e| e.to_string())?;
+
+    #[cfg(all(feature = "touchid", target_os = "macos"))]
+    if cfg.touch_id && !force_password && std::env::var("ONEPW_PASSWORD").is_err() {
+        match onepw::touchid::load(&cfg.label(), "unlock your 1Password account") {
+            Ok((keys, _)) => {
+                match Account::sign_in_with_keys(
+                    &cfg.email,
+                    &cfg.address,
+                    &secret_key,
+                    &keys,
+                    options(cfg.device_uuid.clone()),
+                )
+                .await
+                {
+                    Ok(a) => return Ok(a),
+                    Err(e) => eprintln!("onepw: {e}"),
+                }
+            }
+            Err(e) => eprintln!("onepw: {e}; using the password instead"),
+        }
+    }
+    let _ = force_password;
+
     let creds = Credentials {
         email: cfg.email.clone(),
         password: password()?,
-        secret_key: SecretKey::parse(&sk).map_err(|e| e.to_string())?,
+        secret_key,
         sign_in_address: cfg.address.clone(),
     };
-    Account::sign_in(&creds, options(cfg.device_uuid))
+    let account = Account::sign_in(&creds, options(cfg.device_uuid.clone()))
         .await
-        .map_err(|e| format!("sign-in failed: {e}"))
+        .map_err(|e| format!("sign-in failed: {e}"))?;
+    #[cfg(all(feature = "touchid", target_os = "macos"))]
+    if cfg.touch_id {
+        let _ = onepw::touchid::save(&cfg.label(), account.unlock_keys());
+    }
+    Ok(account)
 }
 
 /// Caches vaults and per-vault items so several references cost one download each.
@@ -308,9 +364,9 @@ async fn run(cli: Cli) -> Result<i32, String> {
                 address,
                 email,
                 device_uuid,
+                touch_id: false,
             };
-            std::fs::write(&p, serde_json::to_string_pretty(&cfg).unwrap())
-                .map_err(|e| e.to_string())?;
+            cfg.save()?;
             eprintln!(
                 "✓ {} ({} vaults). Secret Key saved in the keychain, settings in {}.",
                 cfg.email,
@@ -320,12 +376,14 @@ async fn run(cli: Cli) -> Result<i32, String> {
             eprintln!(
                 "  The account password is never stored: you'll be asked for it each time (or set ONEPW_PASSWORD)."
             );
+            #[cfg(all(feature = "touchid", target_os = "macos"))]
+            eprintln!("  Tip: `onepw account touch-id on` to unlock with Touch ID instead.");
         }
         Cmd::Account(AccountCmd::Show) => {
             let c = load_config()?;
             let in_keychain = keychain(&c.email, &c.address)?.get_password().is_ok();
             println!(
-                "address:     {}\nemail:       {}\ndevice:      {} (shown as \"onepw\")\nSecret Key:  {}",
+                "address:     {}\nemail:       {}\ndevice:      {} (shown as \"onepw\")\nSecret Key:  {}\nTouch ID:    {}",
                 c.address,
                 c.email,
                 c.device_uuid,
@@ -333,16 +391,57 @@ async fn run(cli: Cli) -> Result<i32, String> {
                     "in keychain"
                 } else {
                     "missing"
-                }
+                },
+                if c.touch_id { "on" } else { "off" }
             );
         }
         Cmd::Account(AccountCmd::Forget) => {
             let c = load_config()?;
             let _ = keychain(&c.email, &c.address)?.delete_credential();
+            #[cfg(all(feature = "touchid", target_os = "macos"))]
+            let _ = onepw::touchid::delete(&c.label());
             let _ = std::fs::remove_file(config_path());
             eprintln!(
                 "✓ forgotten. To also revoke the device: 1Password.com → Settings → Devices → \"onepw\"."
             );
+        }
+        Cmd::Account(AccountCmd::TouchId { state }) => {
+            let mut cfg = load_config()?;
+            #[cfg(all(feature = "touchid", target_os = "macos"))]
+            {
+                if state == "on" {
+                    if !onepw::touchid::is_available() {
+                        return Err("Touch ID isn't available on this Mac (no sensor, or no enrolled finger)".into());
+                    }
+                    eprintln!("Sign in once with your password to set up Touch ID…");
+                    let account = sign_in_with(&cfg, true).await?;
+                    let protection = onepw::touchid::save(&cfg.label(), account.unlock_keys())
+                        .map_err(|e| e.to_string())?;
+                    let _ = account.sign_out().await;
+                    cfg.touch_id = true;
+                    cfg.save()?;
+                    eprintln!(
+                        "✓ Touch ID on ({}).",
+                        match protection {
+                            onepw::touchid::Protection::Biometry => "Secure Enclave enforced",
+                            onepw::touchid::Protection::TouchIdGate =>
+                                "checked by onepw; sign the binary with a Developer ID for Secure Enclave enforcement",
+                        }
+                    );
+                } else {
+                    let _ = onepw::touchid::delete(&cfg.label());
+                    cfg.touch_id = false;
+                    cfg.save()?;
+                    eprintln!(
+                        "✓ Touch ID off; stored keys removed. The password will be asked for again."
+                    );
+                }
+            }
+            #[cfg(not(all(feature = "touchid", target_os = "macos")))]
+            {
+                let _ = (&mut cfg, state);
+                return Err("this build has no Touch ID support (macOS, feature `touchid`)".into());
+            }
         }
         Cmd::Vault(VaultCmd::List) => {
             let account = sign_in().await?;

@@ -281,6 +281,7 @@ fn srp_auth(s: &Server, req: &Request) -> ResponseTemplate {
     let premaster = ((v.modpow(&u, g.n()) * &big_a) % g.n()).modpow(&b, g.n());
     let key: [u8; 32] = Sha256::digest(srp::server_hex(&premaster).as_bytes()).into();
     let mut st = s.state.lock().unwrap();
+    st.last_request_id = None; // request IDs are tracked per session
     st.session_key = Some(key);
     st.big_a = Some(big_a);
     st.big_b = Some(big_b.clone());
@@ -528,4 +529,37 @@ async fn wrong_password_is_reported() {
             .contains("wrong account password or Secret Key"),
         "{err}"
     );
+}
+
+#[tokio::test]
+async fn sign_in_with_saved_unlock_keys() {
+    let (server, _state) = setup().await;
+    let first = Account::sign_in(&creds(PASSWORD), opts(&server))
+        .await
+        .expect("password sign-in");
+    let saved = first.unlock_keys().to_bytes();
+
+    // Second sign-in: no password, only the stored keys.
+    let keys = onepw::UnlockKeys::from_bytes(saved.as_ref()).unwrap();
+    let sk = SecretKey::parse(SECRET_KEY).unwrap();
+    let again = Account::sign_in_with_keys(EMAIL, "unused", &sk, &keys, opts(&server))
+        .await
+        .expect("keys sign-in");
+    assert_eq!(
+        again
+            .read("op://Private/GitHub/password")
+            .await
+            .unwrap()
+            .as_str(),
+        "hunter2"
+    );
+
+    // Stale keys (e.g. after a password change) give a clear error.
+    let mut bad = *saved;
+    bad[0] ^= 1;
+    let stale = onepw::UnlockKeys::from_bytes(&bad).unwrap();
+    let err = Account::sign_in_with_keys(EMAIL, "unused", &sk, &stale, opts(&server))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("out of date"), "{err}");
 }
