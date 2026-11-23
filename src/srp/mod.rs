@@ -83,6 +83,24 @@ impl Group {
         &self.g
     }
 
+    /// `k = SHA256(N ‖ PAD(g))`, g left-padded to the length of N (RFC 5054). Used by the
+    /// current login flow.
+    pub fn standard_k(&self) -> BigUint {
+        let mut h = Sha256::new();
+        h.update(self.n.to_bytes_be());
+        h.update(self.pad(&self.g));
+        BigUint::from_bytes_be(&h.finalize())
+    }
+
+    /// `value mod N` as big-endian bytes, left-padded to the byte length of N.
+    fn pad(&self, value: &BigUint) -> Vec<u8> {
+        let len = (self.n.bits() + 7) / 8;
+        let bytes = (value % &self.n).to_bytes_be();
+        let mut out = vec![0u8; len.saturating_sub(bytes.len())];
+        out.extend_from_slice(&bytes);
+        out
+    }
+
     /// `k = SHA256(N ‖ g)` with unpadded g (the 1Password Go library's non-standard default).
     pub fn default_k(&self) -> BigUint {
         let mut h = Sha256::new();
@@ -92,8 +110,20 @@ impl Group {
     }
 }
 
+/// Which generation of 1Password's SRP math to use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Variant {
+    /// Current login flow (`v3/auth/start` → `v2/auth` → `v2/auth/confirm-key`):
+    /// `k = SHA256(N ‖ PAD(g))`, `u = SHA256(PAD(A) ‖ PAD(B))`, client proves first.
+    Standard,
+    /// Older flow and the Go library's default: caller-supplied `k` (or `SHA256(N ‖ g)`),
+    /// `u` over hex strings, server proves first.
+    Legacy,
+}
+
 /// Client side of one SRP exchange.
 pub struct Client {
+    variant: Variant,
     group: Group,
     x: Zeroizing<Vec<u8>>,
     k: BigUint,
@@ -112,12 +142,38 @@ impl Client {
         Self::with_ephemeral(group, x, k, &a.to_bytes_be())
     }
 
+    /// Starts an exchange for the **current** 1Password login flow ([`Variant::Standard`]).
+    pub fn new_standard(group: Group, x: &[u8]) -> Self {
+        let mut c = Self::new(group, x, None);
+        c.variant = Variant::Standard;
+        c.k = c.group.standard_k();
+        c
+    }
+
+    /// Like [`Client::new_standard`] with a fixed ephemeral secret. For tests only.
+    pub fn standard_with_ephemeral(group: Group, x: &[u8], a: &[u8]) -> Self {
+        let mut c = Self::with_ephemeral(group, x, None, a);
+        c.variant = Variant::Standard;
+        c.k = c.group.standard_k();
+        c
+    }
+
+    /// The SRP variant in use.
+    pub fn variant(&self) -> Variant {
+        self.variant
+    }
+
+    /// A as the server expects it on the wire: lowercase hex, leading zeros stripped.
+    pub fn public_a_hex(&self) -> String {
+        server_hex(&self.big_a)
+    }
+
     /// Starts an exchange with a given ephemeral secret `a` (big-endian). For tests only.
     pub fn with_ephemeral(group: Group, x: &[u8], k: Option<BigUint>, a: &[u8]) -> Self {
         let k = k.unwrap_or_else(|| group.default_k());
         let a_int = BigUint::from_bytes_be(a);
         let big_a = group.g.modpow(&a_int, &group.n);
-        Client { group, x: Zeroizing::new(x.to_vec()), k, a: Zeroizing::new(a.to_vec()), big_a }
+        Client { variant: Variant::Legacy, group, x: Zeroizing::new(x.to_vec()), k, a: Zeroizing::new(a.to_vec()), big_a }
     }
 
     /// The client's public value A, sent to the server.
@@ -133,8 +189,36 @@ impl Client {
 
     /// Computes the shared session key from the server's public value B.
     pub fn session_key(&self, big_b: &BigUint) -> Result<SessionKey> {
-        let u = compute_u(&self.big_a, big_b);
+        let u = match self.variant {
+            Variant::Legacy => compute_u(&self.big_a, big_b),
+            Variant::Standard => {
+                let mut h = Sha256::new();
+                h.update(self.group.pad(&self.big_a));
+                h.update(self.group.pad(big_b));
+                BigUint::from_bytes_be(&h.finalize())
+            }
+        };
         self.session_key_with_u(big_b, &u)
+    }
+
+    /// Current flow: the client's proof `M1 = SHA256((H(N) ⊕ H(g)) ‖ H(I) ‖ salt ‖ A ‖ B ‖ K)`,
+    /// sent first. `identity` is [`identity`]`(email, account_id)`.
+    pub fn client_proof(&self, big_b: &BigUint, key: &SessionKey, identity: &str, salt: &[u8]) -> [u8; 32] {
+        self.server_proof(big_b, key, identity, salt)
+    }
+
+    /// Current flow: checks the server's answer `SHA256(A ‖ M1 ‖ K)`.
+    pub fn verify_server_confirmation(&self, m1: &[u8; 32], key: &SessionKey, server_hash: &[u8]) -> Result<()> {
+        let mut h = Sha256::new();
+        h.update(self.big_a.to_bytes_be());
+        h.update(m1);
+        h.update(key.as_bytes());
+        let expected: [u8; 32] = h.finalize().into();
+        if bool::from(expected.as_slice().ct_eq(server_hash)) {
+            Ok(())
+        } else {
+            Err(Error::Protocol("server SRP confirmation did not verify".into()))
+        }
     }
 
     fn session_key_with_u(&self, big_b: &BigUint, u: &BigUint) -> Result<SessionKey> {
@@ -194,6 +278,32 @@ impl Client {
         h.update(key.as_bytes());
         h.finalize().into()
     }
+}
+
+/// The SRP identity `I` of the current flow:
+/// `base64url(SHA256(account_id) ‖ SHA256(lowercase(NFKD(trim(email)))))`.
+pub fn identity(email: &str, account_id: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    let email: String = email.trim().nfkd().collect::<String>().to_lowercase();
+    let mut buf = Vec::with_capacity(64);
+    buf.extend_from_slice(&Sha256::digest(account_id.as_bytes()));
+    buf.extend_from_slice(&Sha256::digest(email.as_bytes()));
+    crate::b64::encode(&buf)
+}
+
+/// Lowercase hex without leading zeros ("0" for zero), the server's wire encoding.
+pub fn server_hex(v: &BigUint) -> String {
+    let h = format!("{v:x}");
+    let t = h.trim_start_matches('0');
+    if t.is_empty() { "0".into() } else { t.into() }
+}
+
+/// Parses a value in the server's hex encoding.
+pub fn from_server_hex(h: &str) -> Result<BigUint> {
+    if h.is_empty() || h.len() > 1024 || !h.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(Error::Protocol("invalid SRP value from server".into()));
+    }
+    BigUint::parse_bytes(h.as_bytes(), 16).ok_or_else(|| Error::Protocol("invalid SRP value from server".into()))
 }
 
 /// `u = SHA256(hex(A) ‖ hex(B))`, lowercase hex with leading zeros stripped.
@@ -290,6 +400,54 @@ mod tests {
             let u = compute_u(&int(a), &int(b));
             assert_eq!(hex::encode(u.to_bytes_be()), expected, "u({a}, {b})");
         }
+    }
+
+    #[test]
+    fn standard_k_matches_1password_go() {
+        // group_test.go: SHA256(N ‖ PAD(g)) for the 4096-bit group.
+        assert_eq!(
+            hex::encode(rfc5054_4096().standard_k().to_bytes_be()),
+            "3509477ea9fca66eadb7cf7b1bd0eb508f54d3989a9c988006a7d0b338374dd2"
+        );
+    }
+
+    #[test]
+    fn standard_exchange_round_trip() {
+        let g = rfc5054_4096();
+        let x = [3u8; 32];
+        let client = Client::new_standard(g.clone(), &x);
+        let v = client.verifier();
+        let k = g.standard_k();
+        let b = rand::thread_rng().gen_biguint(256);
+        let big_b = ((&k * &v) % g.n() + g.g().modpow(&b, g.n())) % g.n();
+        let mut h = Sha256::new();
+        h.update(g.pad(client.public_a()));
+        h.update(g.pad(&big_b));
+        let u = BigUint::from_bytes_be(&h.finalize());
+        let s_server = ((v.modpow(&u, g.n()) * client.public_a()) % g.n()).modpow(&b, g.n());
+        let k_server: [u8; 32] = Sha256::digest(server_hex(&s_server).as_bytes()).into();
+        let key = client.session_key(&big_b).unwrap();
+        assert_eq!(key.as_bytes(), &k_server);
+
+        let id = identity(" Patty@Dogs.Example ", "8MMQJN");
+        assert_eq!(id, identity("patty@dogs.example", "8MMQJN"));
+        let m1 = client.client_proof(&big_b, &key, &id, b"salt");
+        let mut hs = Sha256::new();
+        hs.update(client.public_a().to_bytes_be());
+        hs.update(m1);
+        hs.update(key.as_bytes());
+        let server_hash: [u8; 32] = hs.finalize().into();
+        assert!(client.verify_server_confirmation(&m1, &key, &server_hash).is_ok());
+        assert!(client.verify_server_confirmation(&m1, &key, &[0u8; 32]).is_err());
+    }
+
+    #[test]
+    fn server_hex_round_trip() {
+        let v = int("000abc");
+        assert_eq!(server_hex(&v), "abc");
+        assert_eq!(from_server_hex("abc").unwrap(), v);
+        assert!(from_server_hex("xyz").is_err());
+        assert!(from_server_hex("").is_err());
     }
 
     #[test]

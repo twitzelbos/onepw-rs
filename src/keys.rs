@@ -24,7 +24,8 @@ pub struct EncryptedObject {
     pub enc: String,
     /// Content type of the plaintext, e.g. `"b5+jwk+json"` (a JWK) or `"b5+json"`.
     pub cty: String,
-    /// 12-byte GCM nonce, base64url.
+    /// 12-byte GCM nonce, base64url (empty for RSA-OAEP objects).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub iv: String,
     /// Ciphertext with the 16-byte GCM tag appended, base64url.
     pub data: String,
@@ -235,7 +236,14 @@ impl PrivateKey {
         if obj.kid != self.kid {
             return Err(Error::Decrypt(format!("object is encrypted with key {:?}, not {:?}", obj.kid, self.kid)));
         }
-        let plain = self.decrypt(&b64::decode(&obj.data)?)?;
+        let ct = b64::decode(&obj.data)?;
+        // The object's `enc` says which OAEP hash was used; fall back to the key's own `alg`.
+        let res = match obj.enc.as_str() {
+            "RSA-OAEP-256" => self.key.decrypt(Oaep::new::<sha2::Sha256>(), &ct),
+            "RSA-OAEP" => self.key.decrypt(Oaep::new::<sha1::Sha1>(), &ct),
+            other => return Err(Error::Unsupported(format!("vault key encryption {other:?}"))),
+        };
+        let plain = res.map(Zeroizing::new).map_err(|_| Error::Decrypt(format!("RSA-OAEP with key {:?}", self.kid)))?;
         Ok(serde_json::from_slice(&plain)?)
     }
 }
@@ -262,6 +270,9 @@ pub struct EncryptedKeyset {
     /// The RSA public key (JWK).
     #[serde(default)]
     pub pub_key: serde_json::Value,
+    /// Sequence number; the newest keyset has the highest.
+    #[serde(default)]
+    pub sn: Option<u64>,
 }
 
 /// A decrypted keyset.
@@ -334,6 +345,20 @@ mod tests {
     }
 
     #[test]
+    fn decrypts_1password_session_payload_vector() {
+        // Known answer from 1Password's burp-1password-session-analyzer EncryptedMessageTests (BSD-3):
+        // a server response encrypted with the SRP session key, kid = session ID.
+        let obj: EncryptedObject = serde_json::from_str(
+            r#"{"kid":"YKQRP2M3HZFPZDNXTHQBYFPB5M","enc":"A256GCM","cty":"b5+jwk+json",
+                "iv":"tYENu1VjK9bH7Ppn","data":"ajyndPzqt8mnc2R4x_ZGJSmRY6qqbOKKiEljvvNce1xtHNmc_jdbm5oBbQ=="}"#,
+        )
+        .unwrap();
+        let k: [u8; 32] = b64::decode("6fsZq-Md2jvAM7Bk8qLv0z59y68np5IxLK4RLgI_zog").unwrap().try_into().unwrap();
+        let key = SymmetricKey::new("YKQRP2M3HZFPZDNXTHQBYFPB5M", k);
+        assert_eq!(obj.decrypt(&key).unwrap().as_slice(), br#"{"users":[],"totalCount":0}"#);
+    }
+
+    #[test]
     fn wrong_key_or_tamper_fails() {
         let key = SymmetricKey::new("abc", [7u8; 32]);
         let mut obj = EncryptedObject::encrypt(&key, "b5+json", b"secret");
@@ -377,6 +402,7 @@ mod tests {
             enc_sym_key: EncryptedObject::encrypt(&auk, "b5+jwk+json", sym_jwk.to_string().as_bytes()),
             enc_pri_key: EncryptedObject::encrypt(&sym, "b5+jwk+json", pri.to_string().as_bytes()),
             pub_key: serde_json::Value::Null,
+            sn: Some(1),
         };
         let out = decrypt_keysets(&[ks], &auk).unwrap();
         assert_eq!(out[0].sym.as_bytes(), sym.as_bytes());

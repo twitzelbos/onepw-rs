@@ -2,15 +2,16 @@
 //!
 //! ```text
 //! p   ← NFKD(trim(password))
-//! s   ← HKDF-SHA256(ikm = salt, salt = lowercase(email), info = alg,     len = 32)
+//! s   ← HKDF-SHA256(ikm = salt, salt = lowercase(email), info = label,   len = 32)
 //! k_m ← PBKDF2-HMAC-SHA256(p, s, iterations, 32)
 //! k_A ← HKDF-SHA256(ikm = secret,  salt = account ID,     info = format, len = 32)
 //! out ← k_m ⊕ k_A
 //! ```
 //!
-//! The same function yields the **Account Unlock Key** (with the `p2s`/`p2c` of the encrypted
-//! symmetric key) and the **SRP secret x** (with the separate SRP salt and iterations from the
-//! auth response). Only the salts differ.
+//! The same function yields the **Account Unlock Key** (`label` = the key's `alg`, e.g.
+//! `"PBES2g-HS256"`, with the `p2s`/`p2c` of the encrypted symmetric key) and the **SRP secret
+//! x** (`label` = the SRP method, e.g. `"SRPg-4096"`, with the salt and iterations from the auth
+//! response).
 
 use hkdf::Hkdf;
 use sha2::Sha256;
@@ -26,21 +27,23 @@ pub const ALG_PBES2G_HS256: &str = "PBES2g-HS256";
 
 /// Account password preprocessing: trim surrounding whitespace, then Unicode NFKD.
 pub fn normalize_password(password: &str) -> Zeroizing<String> {
-    Zeroizing::new(password.trim().nfkd().collect::<String>().trim().to_string())
+    Zeroizing::new(password.trim().nfkd().collect::<String>())
 }
 
-/// Runs 2SKD and returns the 32-byte result.
+/// SRP method of the 4096-bit group.
+pub const SRP_METHOD_4096: &str = "SRPg-4096";
+
+/// Runs 2SKD and returns the 32-byte result. `label` is the HKDF info for the salt stretch:
+/// the `alg` for the Account Unlock Key, the SRP `method` for SRP-x.
 pub fn two_secret_kdf(
     password: &str,
     secret_key: &SecretKey,
     email: &str,
-    alg: &str,
+    label: &str,
     salt: &[u8],
     iterations: u32,
 ) -> Result<Zeroizing<[u8; 32]>> {
-    if alg != ALG_PBES2G_HS256 {
-        return Err(Error::Unsupported(format!("key derivation algorithm {alg:?}")));
-    }
+    let alg = label;
     if iterations == 0 {
         return Err(Error::Malformed("iteration count is 0".into()));
     }
@@ -76,8 +79,27 @@ pub fn account_unlock_key(
     salt: &[u8],
     iterations: u32,
 ) -> Result<SymmetricKey> {
+    if alg != ALG_PBES2G_HS256 {
+        return Err(Error::Unsupported(format!("key derivation algorithm {alg:?}")));
+    }
     let k = two_secret_kdf(password, secret_key, email, alg, salt, iterations)?;
     Ok(SymmetricKey::new("mp", *k))
+}
+
+/// Derives the SRP secret `x` for the given SRP method (e.g. `"SRPg-4096"`) and the salt and
+/// iterations from the auth response.
+pub fn srp_x(
+    password: &str,
+    secret_key: &SecretKey,
+    email: &str,
+    method: &str,
+    salt: &[u8],
+    iterations: u32,
+) -> Result<Zeroizing<[u8; 32]>> {
+    if method != SRP_METHOD_4096 {
+        return Err(Error::Unsupported(format!("SRP method {method:?}")));
+    }
+    two_secret_kdf(password, secret_key, email, method, salt, iterations)
 }
 
 #[cfg(test)]
@@ -110,6 +132,15 @@ mod tests {
     #[test]
     fn rejects_unknown_algorithm() {
         let sk = SecretKey::parse("A3-8MMQJN-MZ64CY-2SDB4-RPX3T-V52Q3-N2C84").unwrap();
-        assert!(two_secret_kdf("pw", &sk, "e@x", "PBES2-HS512", &[0; 16], 1).is_err());
+        assert!(account_unlock_key("pw", &sk, "e@x", "PBES2-HS512", &[0; 16], 1).is_err());
+        assert!(srp_x("pw", &sk, "e@x", "SRPg-2048", &[0; 16], 1).is_err());
+    }
+
+    #[test]
+    fn auk_and_srp_x_differ_by_label() {
+        let sk = SecretKey::parse("A3-8MMQJN-MZ64CY-2SDB4-RPX3T-V52Q3-N2C84").unwrap();
+        let auk = account_unlock_key("pw", &sk, "e@x", ALG_PBES2G_HS256, &[1; 16], 10).unwrap();
+        let x = srp_x("pw", &sk, "e@x", SRP_METHOD_4096, &[1; 16], 10).unwrap();
+        assert_ne!(auk.as_bytes(), &*x);
     }
 }
