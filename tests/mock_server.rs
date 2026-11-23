@@ -206,7 +206,12 @@ fn confirm_key(s: &Server, req: &Request) -> ResponseTemplate {
     let hg = Sha256::digest(g.g().to_bytes_be());
     let mut m = Sha256::new();
     m.update(hn.iter().zip(hg.iter()).map(|(x, y)| x ^ y).collect::<Vec<u8>>());
-    m.update(Sha256::digest(srp::identity(EMAIL, "8MMQJN").as_bytes()));
+    // Server-side identity, written out independently of the client's srp::identity():
+    // I = base64url(SHA256(SHA256(skid) ‖ SHA256(email))).
+    let mut inner = Sha256::digest(b"8MMQJN").to_vec();
+    inner.extend_from_slice(&Sha256::digest(EMAIL.as_bytes()));
+    let identity = b64(&Sha256::digest(&inner));
+    m.update(Sha256::digest(identity.as_bytes()));
     m.update(&s.fx.srp_salt);
     m.update(a.to_bytes_be());
     m.update(b.to_bytes_be());

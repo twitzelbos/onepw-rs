@@ -281,14 +281,14 @@ impl Client {
 }
 
 /// The SRP identity `I` of the current flow:
-/// `base64url(SHA256(account_id) ‖ SHA256(lowercase(NFKD(trim(email)))))`.
+/// `base64url(SHA256(SHA256(account_id) ‖ SHA256(lowercase(NFKD(trim(email))))))`.
 pub fn identity(email: &str, account_id: &str) -> String {
     use unicode_normalization::UnicodeNormalization;
     let email: String = email.trim().nfkd().collect::<String>().to_lowercase();
     let mut buf = Vec::with_capacity(64);
     buf.extend_from_slice(&Sha256::digest(account_id.as_bytes()));
     buf.extend_from_slice(&Sha256::digest(email.as_bytes()));
-    crate::b64::encode(&buf)
+    crate::b64::encode(&Sha256::digest(&buf))
 }
 
 /// Lowercase hex without leading zeros ("0" for zero), the server's wire encoding.
@@ -439,6 +439,15 @@ mod tests {
         let server_hash: [u8; 32] = hs.finalize().into();
         assert!(client.verify_server_confirmation(&m1, &key, &server_hash).is_ok());
         assert!(client.verify_server_confirmation(&m1, &key, &[0u8; 32]).is_err());
+    }
+
+    #[test]
+    fn identity_is_hash_of_hashes() {
+        let id = identity(" Patty@Dogs.Example ", "8MMQJN");
+        let mut inner = Sha256::digest(b"8MMQJN").to_vec();
+        inner.extend_from_slice(&Sha256::digest(b"patty@dogs.example"));
+        assert_eq!(id, crate::b64::encode(&Sha256::digest(&inner)));
+        assert_eq!(id.len(), 43, "base64url of a 32-byte digest, unpadded");
     }
 
     #[test]
