@@ -2,6 +2,14 @@
 name = "onepw"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.85"
+description = "Unofficial pure-Rust client for 1Password accounts (SRP sign-in, vault and item decryption). Not affiliated with 1Password."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/twitzelbos/onepw"
+readme = "README.md"
+keywords = ["1password", "password-manager", "srp", "secrets"]
+categories = ["cryptography", "api-bindings", "authentication"]
+exclude = ["/.github"]
 
 [dependencies]
 aes-gcm = "0.10"
