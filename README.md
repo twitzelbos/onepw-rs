@@ -1,5 +1,7 @@
 # onepw
 
+[![crates.io](https://img.shields.io/crates/v/onepw.svg)](https://crates.io/crates/onepw) [![docs.rs](https://docs.rs/onepw/badge.svg)](https://docs.rs/onepw) [![CI](https://github.com/twitzelbos/onepw-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/twitzelbos/onepw-rs/actions/workflows/ci.yml)
+
 An **unofficial**, pure-Rust client for 1Password accounts. It signs in with your account password and Secret Key, unlocks your keys, and reads vaults, items and `op://` secret references, talking to 1Password's servers directly. It needs neither the `op` CLI nor the desktop app.
 
 > **⚠️ Not affiliated with, endorsed by, or supported by AgileBits Inc. / 1Password.**
@@ -22,7 +24,7 @@ Version 0.1 is experimental, and the API will change.
 
 ```toml
 [dependencies]
-onepw = { git = "https://github.com/twitzelbos/onepw-rs" }
+onepw = "0.1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
