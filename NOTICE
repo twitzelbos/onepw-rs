@@ -1,0 +1,9 @@
+onepw — unofficial pure-Rust 1Password client
+Copyright (c) 2026 Thomas Witzel
+
+This product includes SRP test vectors and follows the SRP variant of
+github.com/1Password/srp, Copyright 2017-2022 AgileBits, Inc.,
+licensed under the Apache License, Version 2.0.
+
+"1Password" is a trademark of AgileBits Inc. This project is not affiliated
+with, endorsed by, or supported by AgileBits Inc.

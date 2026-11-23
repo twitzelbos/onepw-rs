@@ -1,0 +1,326 @@
+//! SRP-6a client, in the variant 1Password uses.
+//!
+//! This follows 1Password's open-source Go implementation (github.com/1Password/srp, Apache-2.0),
+//! which deliberately deviates from RFC 5054 / RFC 2945 in a few places:
+//!
+//! * `u = SHA256(hex(A) ‖ hex(B))` over the *lowercase hex strings* of A and B with leading `0`
+//!   characters stripped (not the padded big-endian bytes).
+//! * The session key is `K = SHA256(hex(S))`, again over the lowercase hex string of S.
+//! * The multiplier `k` is supplied by the caller (1Password derives it from the session); when
+//!   absent, `k = SHA256(N ‖ g)` with *unpadded* g.
+//! * Proofs use SHA-256 over unpadded big-endian integers and the **server proves first**:
+//!   `M = SHA256((H(N) ⊕ H(g)) ‖ H(I) ‖ salt ‖ A ‖ B ‖ K)`, then the client answers with
+//!   `SHA256(A ‖ M ‖ K)`.
+//!
+//! `x` is not computed here: in 1Password it comes from two-secret key derivation (see
+//! [`crate::kdf`]).
+
+use num_bigint_dig::{BigUint, RandBigInt};
+use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
+use zeroize::{Zeroize, Zeroizing};
+
+use crate::error::{Error, Result};
+
+/// A Diffie-Hellman group for SRP.
+#[derive(Clone, Debug)]
+pub struct Group {
+    n: BigUint,
+    g: BigUint,
+    /// Size of the random client exponent `a`, in bytes.
+    exponent_size: usize,
+    /// Label used by 1Password's Go library, e.g. `"5054A4096"`.
+    pub label: &'static str,
+}
+
+/// RFC 3526 group 16 / RFC 5054 4096-bit group, g = 5. This is what `"SRPg-4096"` refers to.
+pub fn rfc5054_4096() -> Group {
+    const N_HEX: &str = concat!(
+        "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E08",
+        "8A67CC74020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B",
+        "302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9",
+        "A637ED6B0BFF5CB6F406B7EDEE386BFB5A899FA5AE9F24117C4B1FE6",
+        "49286651ECE45B3DC2007CB8A163BF0598DA48361C55D39A69163FA8",
+        "FD24CF5F83655D23DCA3AD961C62F356208552BB9ED529077096966D",
+        "670C354E4ABC9804F1746C08CA18217C32905E462E36CE3BE39E772C",
+        "180E86039B2783A2EC07A28FB5C55DF06F4C52C9DE2BCBF695581718",
+        "3995497CEA956AE515D2261898FA051015728E5A8AAAC42DAD33170D",
+        "04507A33A85521ABDF1CBA64ECFB850458DBEF0A8AEA71575D060C7D",
+        "B3970F85A6E1E4C7ABF5AE8CDB0933D71E8C94E04A25619DCEE3D226",
+        "1AD2EE6BF12FFA06D98A0864D87602733EC86A64521F2B18177B200C",
+        "BBE117577A615D6C770988C0BAD946E208E24FA074E5AB3143DB5BFC",
+        "E0FD108E4B82D120A92108011A723C12A787E6D788719A10BDBA5B26",
+        "99C327186AF4E23C1A946834B6150BDA2583E9CA2AD44CE8DBBBC2DB",
+        "04DE8EF92E8EFC141FBECAA6287C59474E6BC05D99B2964FA090C3A2",
+        "233BA186515BE7ED1F612970CEE2D7AFB81BDD762170481CD0069127",
+        "D5B05AA993B4EA988D8FDDC186FFB7DC90A6C08F4DF435C934063199",
+        "FFFFFFFFFFFFFFFF",
+    );
+    Group {
+        n: BigUint::parse_bytes(N_HEX.as_bytes(), 16).expect("valid group prime"),
+        g: BigUint::from(5u32),
+        exponent_size: 38,
+        label: "5054A4096",
+    }
+}
+
+impl Group {
+    /// Looks up the group for a 1Password SRP method string such as `"SRPg-4096"`.
+    pub fn for_method(method: &str) -> Result<Group> {
+        match method {
+            "SRPg-4096" => Ok(rfc5054_4096()),
+            other => Err(Error::Unsupported(format!("SRP method {other:?}"))),
+        }
+    }
+
+    /// The prime modulus N.
+    pub fn n(&self) -> &BigUint {
+        &self.n
+    }
+
+    /// The generator g.
+    pub fn g(&self) -> &BigUint {
+        &self.g
+    }
+
+    /// `k = SHA256(N ‖ g)` with unpadded g (the 1Password Go library's non-standard default).
+    pub fn default_k(&self) -> BigUint {
+        let mut h = Sha256::new();
+        h.update(self.n.to_bytes_be());
+        h.update(self.g.to_bytes_be());
+        BigUint::from_bytes_be(&h.finalize())
+    }
+}
+
+/// Client side of one SRP exchange.
+pub struct Client {
+    group: Group,
+    x: Zeroizing<Vec<u8>>,
+    k: BigUint,
+    a: Zeroizing<Vec<u8>>,
+    big_a: BigUint,
+}
+
+impl Client {
+    /// Starts an exchange with a fresh random ephemeral secret.
+    ///
+    /// `x` is the 32-byte SRP secret from 2SKD. `k` is the multiplier; `None` uses
+    /// [`Group::default_k`].
+    pub fn new(group: Group, x: &[u8], k: Option<BigUint>) -> Self {
+        let len = group.exponent_size.max(32);
+        let a = rand::thread_rng().gen_biguint(len * 8);
+        Self::with_ephemeral(group, x, k, &a.to_bytes_be())
+    }
+
+    /// Starts an exchange with a given ephemeral secret `a` (big-endian). For tests only.
+    pub fn with_ephemeral(group: Group, x: &[u8], k: Option<BigUint>, a: &[u8]) -> Self {
+        let k = k.unwrap_or_else(|| group.default_k());
+        let a_int = BigUint::from_bytes_be(a);
+        let big_a = group.g.modpow(&a_int, &group.n);
+        Client { group, x: Zeroizing::new(x.to_vec()), k, a: Zeroizing::new(a.to_vec()), big_a }
+    }
+
+    /// The client's public value A, sent to the server.
+    pub fn public_a(&self) -> &BigUint {
+        &self.big_a
+    }
+
+    /// The verifier `v = g^x mod N`. A client only needs this when registering or changing
+    /// credentials.
+    pub fn verifier(&self) -> BigUint {
+        self.group.g.modpow(&BigUint::from_bytes_be(&self.x), &self.group.n)
+    }
+
+    /// Computes the shared session key from the server's public value B.
+    pub fn session_key(&self, big_b: &BigUint) -> Result<SessionKey> {
+        let u = compute_u(&self.big_a, big_b);
+        self.session_key_with_u(big_b, &u)
+    }
+
+    fn session_key_with_u(&self, big_b: &BigUint, u: &BigUint) -> Result<SessionKey> {
+        let n = &self.group.n;
+        let b_mod = big_b % n;
+        if b_mod == BigUint::from(0u32) || b_mod == BigUint::from(1u32) {
+            return Err(Error::Protocol("server sent an invalid SRP public value B".into()));
+        }
+        if *u == BigUint::from(0u32) {
+            return Err(Error::Protocol("SRP scrambling parameter u is zero".into()));
+        }
+        let x = BigUint::from_bytes_be(&self.x);
+        let a = BigUint::from_bytes_be(&self.a);
+        let kgx = (&self.k * self.group.g.modpow(&x, n)) % n;
+        let base = (b_mod + n - kgx) % n;
+        let exponent = u * &x + &a;
+        let mut s = base.modpow(&exponent, n);
+        let mut s_hex = format!("{s:x}");
+        let key: [u8; 32] = Sha256::digest(s_hex.as_bytes()).into();
+        s_hex.zeroize();
+        s.zeroize();
+        Ok(SessionKey(Zeroizing::new(key)))
+    }
+
+    /// Checks the server's proof `M` (the server proves first in 1Password's variant) and, if it
+    /// is valid, returns the client's proof `SHA256(A ‖ M ‖ K)` to send back.
+    pub fn verify_server_and_prove(
+        &self,
+        big_b: &BigUint,
+        key: &SessionKey,
+        username: &str,
+        salt: &[u8],
+        server_proof: &[u8],
+    ) -> Result<[u8; 32]> {
+        let expected = self.server_proof(big_b, key, username, salt);
+        if !bool::from(expected.as_slice().ct_eq(server_proof)) {
+            return Err(Error::Protocol("server SRP proof did not verify".into()));
+        }
+        let mut h = Sha256::new();
+        h.update(self.big_a.to_bytes_be());
+        h.update(expected);
+        h.update(key.as_bytes());
+        Ok(h.finalize().into())
+    }
+
+    /// The proof the server is expected to send: `SHA256((H(N) ⊕ H(g)) ‖ H(I) ‖ salt ‖ A ‖ B ‖ K)`.
+    pub fn server_proof(&self, big_b: &BigUint, key: &SessionKey, username: &str, salt: &[u8]) -> [u8; 32] {
+        let hn = Sha256::digest(self.group.n.to_bytes_be());
+        let hg = Sha256::digest(self.group.g.to_bytes_be());
+        let xor: Vec<u8> = hn.iter().zip(hg.iter()).map(|(a, b)| a ^ b).collect();
+        let mut h = Sha256::new();
+        h.update(xor);
+        h.update(Sha256::digest(username.as_bytes()));
+        h.update(salt);
+        h.update(self.big_a.to_bytes_be());
+        h.update(big_b.to_bytes_be());
+        h.update(key.as_bytes());
+        h.finalize().into()
+    }
+}
+
+/// `u = SHA256(hex(A) ‖ hex(B))`, lowercase hex with leading zeros stripped.
+pub fn compute_u(big_a: &BigUint, big_b: &BigUint) -> BigUint {
+    let ha = format!("{big_a:x}");
+    let hb = format!("{big_b:x}");
+    let mut h = Sha256::new();
+    h.update(ha.trim_start_matches('0').as_bytes());
+    h.update(hb.trim_start_matches('0').as_bytes());
+    BigUint::from_bytes_be(&h.finalize())
+}
+
+/// The 32-byte SRP session key `K`. Zeroed on drop and never printed.
+pub struct SessionKey(Zeroizing<[u8; 32]>);
+
+impl SessionKey {
+    /// Raw key bytes.
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SessionKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SessionKey(<redacted>)")
+    }
+}
+
+#[cfg(test)]
+mod u_vectors;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn int(h: &str) -> BigUint {
+        BigUint::parse_bytes(h.as_bytes(), 16).unwrap()
+    }
+
+    // Vectors from github.com/1Password/srp srp_test.go (Apache-2.0).
+    const X: &str = "740299d2306764ad9e87f37cd54179e388fd45c85fea3b030eb425d7adcb2773";
+
+    #[test]
+    fn verifier_4096_matches_1password_go() {
+        let expected = concat!(
+            "d05240ed513a4f267608e64cf2a84f5106741ddbf1435707a84f530207409d7",
+            "af1e671182f9d77855b61c628df2b8f6ba8e9b6068fbc84fab80b4542f44c666e17358ebffa8d6fb00fd7037a",
+            "b9ee450413f240ab1e4b586e48bf43ce38f41ad7e406d0150ea83c8f216db4dec06ec5d9fb1cbfd049f70438f",
+            "c14a2faa2a920ad1b298bb1c70989d17163cf52632f202e77824d71c0ff2dd2ef63ebdcd6140beb471b9a7f7b",
+            "14e2d45478994dac95d27f2b45404e564c90eb65655bf6a789bfd665035f711b7cf766a380b921a666dfcfee0",
+            "238b27eafdd8a953a50cc2c4f291458d48ef9fd0740da59aa325b9165ebb97d125511b03e1056bd448b322d7d",
+            "250816783462cff6f9ecd40813522dac10329b7c4bcd0c8f0ceec2eb2c46ba442ac62a84994e2fcdb94cbfe05",
+            "7cad578c5e4d28822cd283e8430b8a1e1106f6e2536e8596b8a0de46717fbd4e9f06b796364aa930bbcf87433",
+            "cbbbf15b077b2998569027edcae71d09112857d0fac06d9f9f70371f43f8581a229c290ade4e63251f8d8a0c9",
+            "61e20d357069472db3ff422c3ecacf6ff9b2af54003d6aa344a37e7a7f04a1a667d5299475cea6b02c09b5850",
+            "5c895efbd86703a0a375ccdf81616e8bee6cfc947467c4bcbe4a7d3e245df32cd7192e212ffe635ff8ac9727d",
+            "6fe05ede8338f6f3bc18b5359ea8afc13ce3952cd426fb0934c5ea54e71e10bf81028f",
+        );
+        let c = Client::new(rfc5054_4096(), &int(X).to_bytes_be(), None);
+        assert_eq!(c.verifier(), int(expected));
+    }
+
+    #[test]
+    fn session_key_4096_matches_1password_go() {
+        let a = int("f1ecc95bb29e8a360e9b257d5688c83d503506a6a6eba683f1e06");
+        let b = int(concat!(
+            "780a5495cbf731d2463fd01d28822e7d9ccf697c4239d5151f85666aa06b3767e0301b54cfad3bd2b526d4d8a1d9",
+            "6492e59c8d8ecddca96b7e288f186155ffa57b50df6bc2103b6004400b797334a22d9dd234b40142a5ab714ea607",
+            "0d2ed55096049f50efba99862b72f7e7aee51ed71ba6663fff570cc713d456316f3535630e87a245f09b0791c6e6",
+            "87baa65bf2dfb5c17e50c250256cdad4c9851a2484e88326888060ae9578b5a60e0c85143b25f4fb4fca794e266a",
+            "4359642da085672d6a3b881649a387875685aeb1ae3d809bf7818dcad596c6e29d566ae87c0ad645a0fcc2eb4f06",
+            "6c097670adf48cf0954918fda4dc30588261321d592f890eed87a950d387b48cf6b4a49f9d497323f683091ae6a4",
+            "efe675d6bfc4393c0c3d54c9adad65b8dd3a7b7e85cd5d31e97bebc8f23b370348dab53903ec5085cbf65de5e549",
+            "1f417e5bf9953f081e788f36c26cbe00664a1256c4befb00765ea7e432af189521442c186f14442b1957e444426f",
+            "740f363ebda943da2bb3b18a13e2f41be9cc3ca0a1b111f6983f9b8d0ee0f4b573c6042fbc0ca029821ebe517ed0",
+            "755a94f42d32b0abef9240af0f37b5fe0e90c4ca83acf91d28a7f3acff5657bf69fdb7747e380b23fd437f637da2",
+            "f7ebcf8733a69a75715fe3894e1799906b48e3ae818332cf5f9533e7af5a1f065f907c8f31fe778fa2da853e6992",
+            "6fc551d6b3ae",
+        ));
+        let u = int("dad353365f78590c1857b29f16e3a947df4707868e2dd2d2b4eafd35c8c854a1");
+        // k as used in the Go test: the raw ASCII bytes of a 1Password session ID.
+        let k = BigUint::from_bytes_be(b"H27JRK5M4NBJXOBCOETCVXJHFA");
+        let c = Client::with_ephemeral(rfc5054_4096(), &int(X).to_bytes_be(), Some(k), &a.to_bytes_be());
+        let key = c.session_key_with_u(&b, &u).unwrap();
+        assert_eq!(
+            hex::encode(key.as_bytes()),
+            "f6bef3d6fa5a08a849bf61041cd5b3185c16aede851c819a3644fa7e918c4da6"
+        );
+    }
+
+    #[test]
+    fn u_matches_1password_go() {
+        for (a, b, expected) in u_vectors::U_VECTORS {
+            let u = compute_u(&int(a), &int(b));
+            assert_eq!(hex::encode(u.to_bytes_be()), expected, "u({a}, {b})");
+        }
+    }
+
+    #[test]
+    fn rejects_degenerate_b() {
+        let g = rfc5054_4096();
+        let n = g.n().clone();
+        let c = Client::new(g, &[7u8; 32], None);
+        assert!(c.session_key(&n).is_err());
+        assert!(c.session_key(&(n + 1u32)).is_err());
+    }
+
+    #[test]
+    fn full_exchange_round_trip() {
+        // Simulate the server side to check client and server agree on K and on the proofs.
+        let g = rfc5054_4096();
+        let x = [42u8; 32];
+        let client = Client::new(g.clone(), &x, None);
+        let v = client.verifier();
+        let k = g.default_k();
+        let b = rand::thread_rng().gen_biguint(38 * 8);
+        let big_b = ((&k * &v) % g.n() + g.g().modpow(&b, g.n())) % g.n();
+
+        let u = compute_u(client.public_a(), &big_b);
+        let s_server = ((v.modpow(&u, g.n()) * client.public_a()) % g.n()).modpow(&b, g.n());
+        let k_server: [u8; 32] = Sha256::digest(format!("{s_server:x}").as_bytes()).into();
+
+        let key = client.session_key(&big_b).unwrap();
+        assert_eq!(key.as_bytes(), &k_server);
+
+        let m = client.server_proof(&big_b, &key, "polly@cracker.example", b"salt");
+        assert!(client.verify_server_and_prove(&big_b, &key, "polly@cracker.example", b"salt", &m).is_ok());
+        assert!(client.verify_server_and_prove(&big_b, &key, "polly@cracker.example", b"salt", &[0u8; 32]).is_err());
+    }
+}
