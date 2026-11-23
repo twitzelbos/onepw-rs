@@ -132,9 +132,15 @@ struct Config {
     touch_id: bool,
 }
 
+/// Keychain account label shared by the Secret Key entry and the Touch ID entry.
+fn account_label(email: &str, address: &str) -> String {
+    format!("{email}@{address}")
+}
+
 impl Config {
+    #[cfg_attr(not(all(feature = "touchid", target_os = "macos")), allow(dead_code))]
     fn label(&self) -> String {
-        format!("{}@{}", self.email, self.address)
+        account_label(&self.email, &self.address)
     }
     fn save(&self) -> Result<(), String> {
         let p = config_path();
@@ -157,7 +163,7 @@ fn load_config() -> Result<Config, String> {
 }
 
 fn keychain(cfg_email: &str, address: &str) -> Result<keyring::Entry, String> {
-    keyring::Entry::new(KEYCHAIN_SERVICE, &format!("{cfg_email}@{address}"))
+    keyring::Entry::new(KEYCHAIN_SERVICE, &account_label(cfg_email, address))
         .map_err(|e| format!("keychain: {e}"))
 }
 
