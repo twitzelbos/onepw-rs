@@ -287,18 +287,44 @@ pub struct Keyset {
 }
 
 impl EncryptedKeyset {
-    /// Decrypts the keyset with the key that encrypts it (`kid == encrypted_by`).
+    /// Decrypts the keyset with a symmetric key (the AUK for the primary keyset).
     pub fn decrypt(&self, by: &SymmetricKey) -> Result<Keyset> {
         let sym_jwk: Jwk = self.enc_sym_key.decrypt_json(by)?;
-        let sym = SymmetricKey::from_jwk(&sym_jwk)?;
+        self.finish(&sym_jwk)
+    }
+
+    /// Decrypts the keyset with another, already decrypted keyset: its symmetric key if
+    /// `encSymKey` is AES-GCM, or its RSA private key if `encSymKey` is RSA-OAEP (how group and
+    /// older keysets are wrapped).
+    pub fn decrypt_with_keyset(&self, by: &Keyset) -> Result<Keyset> {
+        let sym_jwk: Jwk = if self.enc_sym_key.enc.starts_with("RSA-OAEP") {
+            by.private.decrypt_object_jwk(&self.enc_sym_key)?
+        } else {
+            self.enc_sym_key.decrypt_json(&by.sym)?
+        };
+        self.finish(&sym_jwk)
+    }
+
+    fn finish(&self, sym_jwk: &Jwk) -> Result<Keyset> {
+        let mut sym = SymmetricKey::from_jwk(sym_jwk)?;
+        if sym.kid.is_empty() {
+            sym.kid = self.uuid.clone();
+        }
         let pri_jwk: Jwk = self.enc_pri_key.decrypt_json(&sym)?;
-        let private = PrivateKey::from_jwk(&pri_jwk)?;
+        let mut private = PrivateKey::from_jwk(&pri_jwk)?;
+        if private.kid.is_empty() {
+            private.kid = self.uuid.clone();
+        }
         Ok(Keyset { uuid: self.uuid.clone(), sym, private })
     }
 }
 
-/// Decrypts a list of keysets, starting from the one encrypted by the Account Unlock Key and
-/// following `encrypted_by` links (older keysets are encrypted by newer ones).
+/// Decrypts a list of keysets, starting from the one(s) encrypted by the Account Unlock Key and
+/// following `encrypted_by` links (other keysets are wrapped by already-decrypted ones, with
+/// AES-GCM or RSA-OAEP).
+///
+/// A keyset encrypted by the AUK that fails to decrypt is an error (wrong password or Secret
+/// Key). Other keysets that can't be decrypted are skipped; they only gate access to some vaults.
 pub fn decrypt_keysets(sets: &[EncryptedKeyset], auk: &SymmetricKey) -> Result<Vec<Keyset>> {
     let mut done: Vec<Keyset> = Vec::new();
     let mut pending: Vec<&EncryptedKeyset> = sets.iter().collect();
@@ -307,26 +333,28 @@ pub fn decrypt_keysets(sets: &[EncryptedKeyset], auk: &SymmetricKey) -> Result<V
         let mut i = 0;
         while i < pending.len() {
             let ks = pending[i];
-            let by = if ks.encrypted_by == auk.kid() {
-                Some(auk.clone())
+            let result = if ks.encrypted_by == auk.kid() {
+                Some(ks.decrypt(auk))
             } else {
-                done.iter().find(|d| d.uuid == ks.encrypted_by).map(|d| d.sym.clone())
+                done.iter().find(|d| d.uuid == ks.encrypted_by).map(|by| ks.decrypt_with_keyset(by))
             };
-            if let Some(by) = by {
-                done.push(ks.decrypt(&by)?);
-                pending.remove(i);
-            } else {
-                i += 1;
+            match result {
+                Some(Ok(k)) => {
+                    done.push(k);
+                    pending.remove(i);
+                }
+                Some(Err(e)) if ks.encrypted_by == auk.kid() => return Err(e),
+                Some(Err(_)) => {
+                    pending.remove(i); // unusable non-primary keyset: skip
+                }
+                None => i += 1,
             }
         }
-        if pending.is_empty() {
+        if pending.is_empty() || pending.len() == before {
+            if done.is_empty() {
+                return Err(Error::Protocol("no keyset could be decrypted with the account password".into()));
+            }
             return Ok(done);
-        }
-        if pending.len() == before {
-            return Err(Error::Protocol(format!(
-                "cannot decrypt keyset(s) {:?}: their keys are missing",
-                pending.iter().map(|k| &k.uuid).collect::<Vec<_>>()
-            )));
         }
     }
 }

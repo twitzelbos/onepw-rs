@@ -81,10 +81,26 @@ fn fixture() -> Fixture {
     enc_sym["p2s"] = b64(&p2s).into();
     enc_sym["p2c"] = 1000.into();
     let enc_pri = EncryptedObject::encrypt(&sym, "b5+jwk+json", pri_jwk.to_string().as_bytes());
-    let keysets = json!({"keysets": [{
-        "uuid": ks_uuid, "encryptedBy": "mp", "sn": 1,
-        "encSymKey": enc_sym, "encPriKey": enc_pri, "pubKey": {"kty":"RSA","alg":"RSA-OAEP-256"}
-    }]});
+    // A second (group-style) keyset whose symmetric key is RSA-OAEP-wrapped by the first one,
+    // as on real accounts. It holds the key of a second, shared vault.
+    let g_uuid = "groupkeyset0000000000000000";
+    let g_sym = SymmetricKey::new(g_uuid, [4u8; 32]);
+    let g_rsa = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+    let g_pri_jwk = json!({"kty":"RSA","kid":g_uuid,"alg":"RSA-OAEP-256","n":e(g_rsa.n()),"e":e(g_rsa.e()),
+        "d":e(g_rsa.d()),"p":e(&g_rsa.primes()[0]),"q":e(&g_rsa.primes()[1])});
+    let g_sym_jwk = json!({"kty":"oct","alg":"A256GCM","kid":g_uuid,"k":b64(g_sym.as_bytes())});
+    let g_wrapped = rsa.to_public_key().encrypt(&mut rng, Oaep::new::<sha1::Sha1>(), g_sym_jwk.to_string().as_bytes()).unwrap();
+    let keysets = json!({"keysets": [
+        {"uuid": g_uuid, "encryptedBy": ks_uuid, "sn": 2,
+         "encSymKey": {"kid": ks_uuid, "enc": "RSA-OAEP", "cty": "b5+jwk+json", "data": b64(&g_wrapped)},
+         "encPriKey": EncryptedObject::encrypt(&g_sym, "b5+jwk+json", g_pri_jwk.to_string().as_bytes()),
+         "pubKey": {"kty":"RSA","alg":"RSA-OAEP-256"}},
+        {"uuid": ks_uuid, "encryptedBy": "mp", "sn": 1,
+         "encSymKey": enc_sym, "encPriKey": enc_pri, "pubKey": {"kty":"RSA","alg":"RSA-OAEP-256"}}
+    ]});
+    let shared_key = SymmetricKey::new("vk2", [5u8; 32]);
+    let shared_jwk = json!({"kty":"oct","alg":"A256GCM","kid":"vk2","k":b64(shared_key.as_bytes())});
+    let shared_wrapped = g_rsa.to_public_key().encrypt(&mut rng, Oaep::new::<sha2::Sha256>(), shared_jwk.to_string().as_bytes()).unwrap();
 
     // Vault key wrapped with RSA-OAEP (SHA-1, as on older accounts) for the keyset.
     let vault_uuid = "p3nfd4jax622nqjos7licewuyn";
@@ -96,6 +112,9 @@ fn fixture() -> Fixture {
          "encAttrs": EncryptedObject::encrypt(&vault_key, "b5+json", br#"{"name":"Private","desc":""}"#),
          "access": [{"acl": 0x0FF_FFF, "accessorUuid": "me",
                      "encVaultKey": {"kid": ks_uuid, "enc": "RSA-OAEP", "cty": "b5+jwk+json", "data": b64(&wrapped)}}]},
+        {"uuid": "sharedvault", "type": "U",
+         "encAttrs": EncryptedObject::encrypt(&shared_key, "b5+json", br#"{"name":"Shared"}"#),
+         "access": [{"acl": 0x0FF_FFF, "encVaultKey": {"kid": g_uuid, "enc": "RSA-OAEP-256", "cty": "b5+jwk+json", "data": b64(&shared_wrapped)}}]},
         {"uuid": "noaccessvault", "type": "U",
          "access": [{"acl": 0, "encVaultKey": {"kid": ks_uuid, "enc": "RSA-OAEP", "cty": "b5+jwk+json", "data": "AAAA"}}]}
     ]});
@@ -300,8 +319,9 @@ async fn full_sign_in_and_read() {
     }
 
     let vaults = account.vaults().await.unwrap();
-    assert_eq!(vaults.len(), 1, "vault without read ACL is skipped");
+    assert_eq!(vaults.len(), 2, "vault without read ACL is skipped");
     assert_eq!(vaults[0].name(), "Private");
+    assert_eq!(vaults[1].name(), "Shared", "vault reached through an RSA-wrapped group keyset");
 
     let items = account.items(&vaults[0]).await.unwrap();
     assert_eq!(items.len(), 3);
