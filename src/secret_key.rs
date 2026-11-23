@@ -26,6 +26,20 @@ pub struct SecretKey {
 
 impl SecretKey {
     /// Parses a Secret Key, ignoring case, hyphens and whitespace.
+    ///
+    /// ```
+    /// use onepw::SecretKey;
+    ///
+    /// // The example key from the 1Password white paper.
+    /// let key = SecretKey::parse("a3-8mmqjn mz64cy-2sdb4-rpx3t-v52q3-n2c84")?;
+    /// assert_eq!(key.format(), "A3");
+    /// assert_eq!(key.account_id(), "8MMQJN");
+    /// assert!(!format!("{key:?}").contains("MZ64CY")); // the secret part is never printed
+    ///
+    /// // 0, 1, I, O and U never appear in Secret Keys.
+    /// assert!(SecretKey::parse("A3-8MMQJN-MZ64CY-2SDB4-RPX3T-V52Q3-N2C8O").is_err());
+    /// # Ok::<(), onepw::Error>(())
+    /// ```
     pub fn parse(input: &str) -> Result<Self> {
         let clean: Zeroizing<String> = Zeroizing::new(
             input

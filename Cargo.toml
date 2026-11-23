@@ -11,6 +11,10 @@ keywords = ["1password", "password-manager", "srp", "secrets"]
 categories = ["cryptography", "api-bindings", "authentication"]
 exclude = ["/.github"]
 
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
 [dependencies]
 aes-gcm = "0.10"
 base64 = "0.22"

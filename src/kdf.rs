@@ -79,6 +79,16 @@ pub fn two_secret_kdf(
 
 /// Derives the Account Unlock Key (`kid = "mp"`) from the parameters stored next to the
 /// encrypted symmetric key (`alg`, `p2s`, `p2c`).
+///
+/// ```
+/// use onepw::{kdf, SecretKey};
+///
+/// let sk = SecretKey::parse("A3-8MMQJN-MZ64CY-2SDB4-RPX3T-V52Q3-N2C84")?;
+/// // Real accounts use 650 000 iterations; few here to keep the example fast.
+/// let auk = kdf::account_unlock_key("password", &sk, "Patty@Dogs.Example", "PBES2g-HS256", &[0u8; 16], 1000)?;
+/// assert_eq!(auk.kid(), "mp");
+/// # Ok::<(), onepw::Error>(())
+/// ```
 pub fn account_unlock_key(
     password: &str,
     secret_key: &SecretKey,

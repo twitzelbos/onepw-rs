@@ -2,8 +2,7 @@
 
 An **unofficial**, pure-Rust client for 1Password accounts. It signs in with your account password and Secret Key, unlocks your keys, and reads vaults, items and `op://` secret references, talking to 1Password's servers directly. It needs neither the `op` CLI nor the desktop app.
 
-> [!WARNING]
-> **Not affiliated with, endorsed by, or supported by AgileBits Inc. / 1Password.**
+> **⚠️ Not affiliated with, endorsed by, or supported by AgileBits Inc. / 1Password.**
 > 1Password's server API is not publicly documented. This crate combines the documented cryptography with a reverse-engineered transport, and **it can stop working whenever 1Password changes its servers.** Using an unofficial client may be against 1Password's terms of service; that's for you to judge. For anything important, use the official [`op` CLI](https://developer.1password.com/docs/cli/) or the [official SDKs](https://developer.1password.com/docs/sdks/).
 
 ## Status

@@ -197,6 +197,18 @@ impl Item {
     /// Finds a field value by its name, label or designation (`"username"`, `"password"`,
     /// `"credential"`, a section field label, …). Looks at top-level fields, the legacy
     /// `password` key, and section fields.
+    ///
+    /// ```no_run
+    /// # async fn run(account: &onepw::Account) -> onepw::Result<()> {
+    /// for vault in account.vaults().await? {
+    ///     for item in account.items(&vault).await? {
+    ///         if let (false, Some(user)) = (item.trashed, item.field("username")) {
+    ///             println!("{}: {}", item.title(), user);
+    ///         }
+    ///     }
+    /// }
+    /// # Ok(()) }
+    /// ```
     pub fn field(&self, name: &str) -> Option<&str> {
         let d = &self.details;
         if let Some(fields) = d.get("fields").and_then(Value::as_array) {
@@ -240,6 +252,31 @@ impl Item {
 
 impl Account {
     /// Signs in with account password + Secret Key and unlocks the account's keys.
+    ///
+    /// ```no_run
+    /// use onepw::{Account, Credentials, SecretKey, SignInOptions};
+    /// use zeroize::Zeroizing;
+    ///
+    /// # async fn run() -> onepw::Result<()> {
+    /// let creds = Credentials {
+    ///     sign_in_address: "my.1password.com".into(),
+    ///     email: "you@example.com".into(),
+    ///     secret_key: SecretKey::parse(&std::env::var("OP_SECRET_KEY").unwrap_or_default())?,
+    ///     password: Zeroizing::new(std::env::var("OP_PASSWORD").unwrap_or_default()),
+    /// };
+    /// let mut opts = SignInOptions::new();
+    /// opts.device_uuid = std::fs::read_to_string("device-uuid").unwrap_or(opts.device_uuid);
+    /// opts.totp = Some(Box::new(|| Ok(rpassword::prompt_password("2FA code: ").unwrap_or_default())));
+    ///
+    /// let account = Account::sign_in(&creds, opts).await?;
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidInput`] for a wrong password or Secret Key (or a Secret Key of another
+    /// account), [`Error::Unsupported`] for 2FA methods other than an authenticator app,
+    /// [`Error::Protocol`] if the server fails its half of the SRP proof.
     pub async fn sign_in(creds: &Credentials, opts: SignInOptions) -> Result<Account> {
         let base = match &opts.base_url {
             Some(u) => u.clone(),
@@ -438,7 +475,14 @@ impl Account {
     }
 
     /// Resolves a secret reference `op://<vault>/<item>/<field>` (names or UUIDs, case-sensitive
-    /// match on names) to its value.
+    /// match on names) to its value. `Private` also matches your personal vault.
+    ///
+    /// ```no_run
+    /// # async fn run(account: &onepw::Account) -> onepw::Result<()> {
+    /// let key = account.read("op://Private/Anthropic API/credential").await?;
+    /// // `key` is a Zeroizing<String>: wiped from memory when dropped.
+    /// # Ok(()) }
+    /// ```
     pub async fn read(&self, reference: &str) -> Result<Zeroizing<String>> {
         let rest = reference
             .strip_prefix("op://")
