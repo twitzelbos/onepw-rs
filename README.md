@@ -23,7 +23,7 @@ Version 0.1 is experimental, and the API will change.
 
 ```toml
 [dependencies]
-onepw = { git = "https://github.com/twitzelbos/onepw" }
+onepw = { git = "https://github.com/twitzelbos/onepw-rs" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
