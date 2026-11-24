@@ -46,8 +46,23 @@ jobs:
       - run: |
           dbus-run-session -- sh -c '
             printf "ci" | gnome-keyring-daemon --unlock --components=secrets >/dev/null
-            cargo test --locked --features cli --bin onepw -- --ignored --test-threads=1
+            cargo test --locked --features cli --bin onepw -- --ignored --test-threads=1 linux_keychain
           '
+
+  # The TPM-sealed Secret Key store (`systemd-creds --user`, systemd 256+), using the host key
+  # (CI machines have no TPM).
+  linux-systemd-creds:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        with:
+          toolchain: stable
+      - run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+      - run: systemd-creds --version | head -1; systemd-creds has-tpm2 || true
+      - run: cargo test --locked --features cli --bin onepw -- --ignored --test-threads=1 systemd_creds
 
   # The minimum supported Rust version in Cargo.toml (rust-version) must keep building.
   msrv:

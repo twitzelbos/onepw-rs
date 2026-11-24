@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- **Linux: TPM-sealed Secret Key for machines without a desktop keychain.**
+  `onepw account add --store systemd-creds` (or `onepw account store systemd-creds` to move an
+  existing key) keeps the Secret Key in `~/.config/onepw/secret-key.cred`, encrypted with
+  `systemd-creds --user` and bound to this machine's TPM2 and host key, your user and the machine
+  ID. Needs systemd 256+ and a TPM2. `onepw account store keychain` moves it back.
+- OpenSSF Scorecard workflow and README badge.
+
+### Changed
+- A rejected 2FA code is reported as `InvalidInput` "2FA code not accepted" (the session has
+  ended, so sign in again), instead of a bare `Server` 401 error.
+
+### Tests
+- 2FA (TOTP) sign-in is now covered by the mock server: the code is sent (trimmed) before
+  anything else, the saved-keys (Touch ID) sign-in asks for it too, a wrong code stops sign-in,
+  and a missing `totp` callback or an unsupported method (Duo) is reported without prompting.
+
 ## 0.3.2 (2026-11-24)
 
 ### Changed

@@ -16,7 +16,7 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use onepw::client::new_device_uuid;
 use onepw::{Account, Credentials, Item, SecretKey, SecretReference, SignInOptions, Vault};
 use serde::{Deserialize, Serialize};
@@ -82,6 +82,14 @@ enum AccountCmd {
         /// Account email.
         #[arg(long)]
         email: Option<String>,
+        /// Where to keep the Secret Key (`systemd-creds`: Linux, sealed to this machine's TPM2).
+        #[arg(long, value_enum, default_value_t = Store::Keychain)]
+        store: Store,
+    },
+    /// Move the Secret Key to another store: `keychain` or `systemd-creds` (Linux, TPM2).
+    Store {
+        #[arg(value_enum)]
+        to: Store,
     },
     /// Show the configured account.
     Show,
@@ -138,6 +146,27 @@ struct Config {
     /// Unlock with Touch ID (macOS) instead of the password.
     #[serde(default)]
     touch_id: bool,
+    /// Where the Secret Key is kept.
+    #[serde(default, skip_serializing_if = "Store::is_keychain")]
+    secret_key_store: Store,
+}
+
+/// Where the CLI keeps the Secret Key.
+#[derive(Serialize, Deserialize, ValueEnum, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+enum Store {
+    /// The OS keychain: macOS Keychain, or the Secret Service on Linux.
+    #[default]
+    Keychain,
+    /// Linux: a file sealed to this machine's TPM2 and your user with `systemd-creds --user`
+    /// (systemd 256 or later). For machines without a desktop keychain.
+    SystemdCreds,
+}
+
+impl Store {
+    fn is_keychain(&self) -> bool {
+        *self == Store::Keychain
+    }
 }
 
 /// Keychain account label shared by the Secret Key entry and the Touch ID entry.
@@ -195,6 +224,14 @@ fn secret_key_text(cfg: &Config) -> Result<Zeroizing<String>, String> {
     if let Ok(s) = std::env::var("ONEPW_SECRET_KEY") {
         return Ok(Zeroizing::new(s));
     }
+    stored_secret_key(cfg, cfg.secret_key_store)
+}
+
+/// The Secret Key from `store` (ignoring `ONEPW_SECRET_KEY`).
+fn stored_secret_key(cfg: &Config, store: Store) -> Result<Zeroizing<String>, String> {
+    if store == Store::SystemdCreds {
+        return systemd_creds::load();
+    }
     let entry = keychain(&cfg.email, &cfg.address)?;
     match entry.get_password() {
         Ok(s) => Ok(Zeroizing::new(s)),
@@ -222,6 +259,197 @@ fn no_secret_key(e: Option<&keyring::Error>) -> String {
             "cannot read the Secret Key from the keychain ({e}). On Linux this needs a running \
              Secret Service (GNOME Keyring, KWallet, KeePassXC); without one, set ONEPW_SECRET_KEY"
         ),
+    }
+}
+
+/// Saves the Secret Key text in `store`.
+fn save_secret_key(email: &str, address: &str, store: Store, text: &str) -> Result<(), String> {
+    match store {
+        Store::Keychain => keychain(email, address)?
+            .set_password(text)
+            .map_err(|e| format!("keychain: {e}")),
+        Store::SystemdCreds => systemd_creds::save(text),
+    }
+}
+
+/// Removes the Secret Key from `store` (ignores "nothing there").
+fn delete_secret_key(email: &str, address: &str, store: Store) {
+    match store {
+        Store::Keychain => {
+            if let Ok(e) = keychain(email, address) {
+                let _ = e.delete_credential();
+            }
+            #[cfg(target_os = "linux")]
+            if let Ok(old) = old_kernel_keyring(email, address) {
+                let _ = old.delete_credential();
+            }
+        }
+        Store::SystemdCreds => {
+            let _ = std::fs::remove_file(systemd_creds::path());
+        }
+    }
+}
+
+fn store_name(store: Store) -> &'static str {
+    match store {
+        Store::Keychain => "the keychain",
+        Store::SystemdCreds => "a TPM-sealed file (systemd-creds)",
+    }
+}
+
+/// The Secret Key sealed with `systemd-creds --user`: encrypted with a key bound to this
+/// machine's TPM2 (and the host key on disk), your UID, user name and machine ID. The file is
+/// useless on another machine or to another user, but any program running as you can ask
+/// systemd to decrypt it, just as it could ask the Secret Service.
+#[cfg(target_os = "linux")]
+mod systemd_creds {
+    use std::io::{Read, Write};
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Stdio};
+
+    use zeroize::Zeroizing;
+
+    /// Embedded in the credential and checked on decryption, so another credential can't be
+    /// swapped in for this file.
+    const NAME: &str = "onepw-secret-key";
+
+    pub fn path() -> PathBuf {
+        super::config_path().with_file_name("secret-key.cred")
+    }
+
+    /// Whether systemd reports a usable TPM2 (`systemd-creds has-tpm2` exits 0 only then).
+    fn has_tpm2() -> bool {
+        Command::new("systemd-creds")
+            .arg("has-tpm2")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+
+    /// Runs `systemd-creds --user --name=… <args>`, feeding `input` on stdin (never argv) and
+    /// returning stdout in a buffer that is wiped on drop.
+    fn run(args: &[&str], input: &[u8]) -> Result<Zeroizing<Vec<u8>>, String> {
+        let mut child = Command::new("systemd-creds")
+            .arg("--user")
+            .arg(format!("--name={NAME}"))
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| {
+                format!("cannot run systemd-creds ({e}); it needs systemd 256 or later")
+            })?;
+        child
+            .stdin
+            .take()
+            .expect("piped")
+            .write_all(input)
+            .map_err(|e| format!("systemd-creds: {e}"))?;
+        // Room for any Secret Key or credential, so the buffer never reallocates (leaving copies).
+        let mut out = Zeroizing::new(Vec::with_capacity(16 * 1024));
+        child
+            .stdout
+            .take()
+            .expect("piped")
+            .read_to_end(&mut out)
+            .map_err(|e| format!("systemd-creds: {e}"))?;
+        let mut err = String::new();
+        let _ = child.stderr.take().expect("piped").read_to_string(&mut err);
+        let status = child.wait().map_err(|e| format!("systemd-creds: {e}"))?;
+        if !status.success() {
+            return Err(format!(
+                "systemd-creds failed ({status}): {} (`--user` needs systemd 256 or later)",
+                err.trim()
+            ));
+        }
+        Ok(out)
+    }
+
+    /// Encrypts `secret` with `key` (`host+tpm2` in real use). Returns the credential (ciphertext).
+    pub(super) fn seal(secret: &str, key: &str) -> Result<Vec<u8>, String> {
+        let out = run(
+            &[&format!("--with-key={key}"), "encrypt", "-", "-"],
+            secret.as_bytes(),
+        )?;
+        Ok(out.to_vec())
+    }
+
+    pub(super) fn unseal(file: &Path) -> Result<Zeroizing<String>, String> {
+        let blob = std::fs::read(file).map_err(|e| format!("{}: {e}", file.display()))?;
+        let out = run(&["--newline=no", "decrypt", "-", "-"], &blob)?;
+        let text = std::str::from_utf8(&out).map_err(|_| "sealed Secret Key is not text")?;
+        Ok(Zeroizing::new(text.to_owned()))
+    }
+
+    /// Writes `blob` to `file`, readable by you only, replacing it atomically.
+    pub(super) fn write_private(file: &Path, blob: &[u8]) -> Result<(), String> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let dir = file.parent().expect("config dir");
+        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        let tmp = file.with_extension("cred.tmp");
+        let _ = std::fs::remove_file(&tmp);
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)
+            .map_err(|e| format!("{}: {e}", tmp.display()))?;
+        f.write_all(blob)
+            .and_then(|()| f.sync_all())
+            .map_err(|e| format!("{}: {e}", tmp.display()))?;
+        std::fs::rename(&tmp, file).map_err(|e| format!("{}: {e}", file.display()))
+    }
+
+    pub fn save(secret: &str) -> Result<(), String> {
+        if !has_tpm2() {
+            return Err(
+                "no usable TPM2 (`systemd-creds has-tpm2`): use the keychain, or set \
+                        ONEPW_SECRET_KEY"
+                    .into(),
+            );
+        }
+        let blob = seal(secret, "host+tpm2")?;
+        let file = path();
+        write_private(&file, &blob)?;
+        // Check it opens before relying on it.
+        match unseal(&file) {
+            Ok(back) if back.as_str() == secret => Ok(()),
+            Ok(_) => Err("systemd-creds returned a different value".into()),
+            Err(e) => Err(e),
+        }
+    }
+
+    pub fn load() -> Result<Zeroizing<String>, String> {
+        let file = path();
+        if !file.exists() {
+            return Err(format!(
+                "Secret Key not found at {}: run `onepw account add --store systemd-creds`",
+                file.display()
+            ));
+        }
+        unseal(&file)
+    }
+}
+
+/// `systemd-creds` is Linux only.
+#[cfg(not(target_os = "linux"))]
+mod systemd_creds {
+    use std::path::PathBuf;
+
+    use zeroize::Zeroizing;
+
+    const LINUX_ONLY: &str = "the systemd-creds store is Linux only";
+
+    pub fn path() -> PathBuf {
+        super::config_path().with_file_name("secret-key.cred")
+    }
+    pub fn save(_: &str) -> Result<(), String> {
+        Err(LINUX_ONLY.into())
+    }
+    pub fn load() -> Result<Zeroizing<String>, String> {
+        Err(LINUX_ONLY.into())
     }
 }
 
@@ -407,7 +635,15 @@ fn vault_label(v: &Vault) -> String {
 
 async fn run(cli: Cli) -> Result<i32, String> {
     match cli.cmd {
-        Cmd::Account(AccountCmd::Add { address, email }) => {
+        Cmd::Account(AccountCmd::Add {
+            address,
+            email,
+            store,
+        }) => {
+            #[cfg(not(target_os = "linux"))]
+            if store == Store::SystemdCreds {
+                return Err("--store systemd-creds is Linux only".into());
+            }
             let address = match address {
                 Some(a) => a,
                 None => prompt("Sign-in address", Some("my.1password.com"))
@@ -434,9 +670,7 @@ async fn run(cli: Cli) -> Result<i32, String> {
                 .map_err(|e| format!("sign-in failed: {e}"))?;
             let n = account.vaults().await.map_err(|e| e.to_string())?.len();
             let _ = account.sign_out().await;
-            keychain(&email, &address)?
-                .set_password(&sk_text)
-                .map_err(|e| format!("keychain: {e}"))?;
+            save_secret_key(&email, &address, store, &sk_text)?;
             let p = config_path();
             std::fs::create_dir_all(p.parent().unwrap()).map_err(|e| e.to_string())?;
             let cfg = Config {
@@ -444,12 +678,14 @@ async fn run(cli: Cli) -> Result<i32, String> {
                 email,
                 device_uuid,
                 touch_id: false,
+                secret_key_store: store,
             };
             cfg.save()?;
             eprintln!(
-                "✓ {} ({} vaults). Secret Key saved in the keychain, settings in {}.",
+                "✓ {} ({} vaults). Secret Key saved in {}, settings in {}.",
                 cfg.email,
                 n,
+                store_name(store),
                 p.display()
             );
             eprintln!(
@@ -460,32 +696,57 @@ async fn run(cli: Cli) -> Result<i32, String> {
         }
         Cmd::Account(AccountCmd::Show) => {
             let c = load_config()?;
-            let in_keychain = keychain(&c.email, &c.address)?.get_password().is_ok();
+            let where_ = match c.secret_key_store {
+                // Only checks the file is there; decrypting it isn't needed to show this.
+                Store::SystemdCreds if systemd_creds::path().exists() => {
+                    format!("TPM-sealed in {}", systemd_creds::path().display())
+                }
+                Store::SystemdCreds => "missing".into(),
+                Store::Keychain if keychain(&c.email, &c.address)?.get_password().is_ok() => {
+                    "in keychain".into()
+                }
+                Store::Keychain => "missing".into(),
+            };
             println!(
                 "address:     {}\nemail:       {}\ndevice:      {} (shown as \"onepw\")\nSecret Key:  {}\nTouch ID:    {}",
                 c.address,
                 c.email,
                 c.device_uuid,
-                if in_keychain {
-                    "in keychain"
-                } else {
-                    "missing"
-                },
+                where_,
                 if c.touch_id { "on" } else { "off" }
             );
         }
         Cmd::Account(AccountCmd::Forget) => {
             let c = load_config()?;
-            let _ = keychain(&c.email, &c.address)?.delete_credential();
-            #[cfg(target_os = "linux")]
-            if let Ok(old) = old_kernel_keyring(&c.email, &c.address) {
-                let _ = old.delete_credential();
-            }
+            delete_secret_key(&c.email, &c.address, Store::Keychain);
+            delete_secret_key(&c.email, &c.address, Store::SystemdCreds);
             #[cfg(all(feature = "touchid", target_os = "macos"))]
             let _ = onepw::touchid::delete(&c.label());
             let _ = std::fs::remove_file(config_path());
             eprintln!(
                 "✓ forgotten. To also revoke the device: 1Password.com → Settings → Devices → \"onepw\"."
+            );
+        }
+        Cmd::Account(AccountCmd::Store { to }) => {
+            let mut cfg = load_config()?;
+            let from = cfg.secret_key_store;
+            if from == to {
+                eprintln!("The Secret Key is already in {}.", store_name(to));
+                return Ok(0);
+            }
+            let text = stored_secret_key(&cfg, from)?;
+            SecretKey::parse(&text).map_err(|e| e.to_string())?;
+            save_secret_key(&cfg.email, &cfg.address, to, &text)?;
+            if stored_secret_key(&cfg, to)?.as_str() != text.as_str() {
+                return Err(format!("{} returned a different value", store_name(to)));
+            }
+            cfg.secret_key_store = to;
+            cfg.save()?;
+            delete_secret_key(&cfg.email, &cfg.address, from);
+            eprintln!(
+                "✓ Secret Key moved from {} to {}.",
+                store_name(from),
+                store_name(to)
             );
         }
         Cmd::Account(AccountCmd::TouchId { state }) => {
@@ -802,6 +1063,7 @@ mod linux_keychain_tests {
             email: "ci@example.com".into(),
             device_uuid: String::new(),
             touch_id: false,
+            secret_key_store: Store::Keychain,
         };
         let sk = "A3-8MMQJN-MZ64CY-2SDB4-RPX3T-V52Q3-N2C84";
         let service = keychain(&cfg.email, &cfg.address).unwrap();
@@ -822,5 +1084,64 @@ mod linux_keychain_tests {
                 .unwrap_err()
                 .contains("onepw account add")
         );
+    }
+}
+
+/// Needs systemd 256+ (for `systemd-creds --user`), so it's ignored by default; CI runs it in the
+/// `linux-systemd-creds` job. CI machines have no TPM, so this uses the host key; real use
+/// requires `host+tpm2`.
+#[cfg(all(test, target_os = "linux"))]
+mod systemd_creds_tests {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::{Command, Stdio};
+
+    use super::systemd_creds::{seal, unseal, write_private};
+
+    const SK: &str = "A3-8MMQJN-MZ64CY-2SDB4-RPX3T-V52Q3-N2C84";
+
+    #[test]
+    #[ignore]
+    fn secret_key_is_sealed_and_bound_to_its_name() {
+        let dir = std::env::temp_dir().join(format!("onepw-creds-{}", std::process::id()));
+        let file = dir.join("secret-key.cred");
+
+        let blob = seal(SK, "host").expect("seal");
+        assert!(
+            !blob.windows(SK.len()).any(|w| w == SK.as_bytes()),
+            "the file holds ciphertext, not the key"
+        );
+        write_private(&file, &blob).unwrap();
+        let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "readable by the user only");
+        assert_eq!(unseal(&file).expect("unseal").as_str(), SK);
+
+        // A tampered file doesn't open.
+        let mut bad = blob.clone();
+        let mid = bad.len() / 2;
+        bad[mid] ^= 1;
+        write_private(&file, &bad).unwrap();
+        assert!(unseal(&file).is_err(), "tampering is detected");
+
+        // A credential made under another name isn't accepted as the Secret Key.
+        let mut child = Command::new("systemd-creds")
+            .args([
+                "--user",
+                "--name=something-else",
+                "--with-key=host",
+                "encrypt",
+                "-",
+                "-",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        std::io::Write::write_all(&mut child.stdin.take().unwrap(), SK.as_bytes()).unwrap();
+        let other = child.wait_with_output().unwrap();
+        assert!(other.status.success());
+        write_private(&file, &other.stdout).unwrap();
+        assert!(unseal(&file).is_err(), "the embedded name is checked");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

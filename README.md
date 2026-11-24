@@ -1,6 +1,6 @@
 # onepw
 
-[![crates.io](https://img.shields.io/crates/v/onepw.svg)](https://crates.io/crates/onepw) [![docs.rs](https://docs.rs/onepw/badge.svg)](https://docs.rs/onepw) [![CI](https://github.com/twitzelbos/onepw-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/twitzelbos/onepw-rs/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/onepw.svg)](https://crates.io/crates/onepw) [![docs.rs](https://docs.rs/onepw/badge.svg)](https://docs.rs/onepw) [![CI](https://github.com/twitzelbos/onepw-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/twitzelbos/onepw-rs/actions/workflows/ci.yml)  [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/twitzelbos/onepw-rs/badge)](https://scorecard.dev/viewer/?uri=github.com/twitzelbos/onepw-rs)
 
 An **unofficial**, pure-Rust client for 1Password accounts. It signs in with your account password and Secret Key, unlocks your keys, and reads vaults, items and `op://` secret references, talking to 1Password's servers directly. It needs neither the `op` CLI nor the desktop app.
 
@@ -98,10 +98,11 @@ onepw item get GitHub [--reveal] [--json]  # concealed values hidden unless --re
 onepw read op://Private/GitHub/password    # like `op read`; -n for no trailing newline
 onepw run --env-file .env.op -- cargo run  # like `op run`: op:// values in the env/env file are resolved
 onepw account show | forget
+onepw account store keychain | systemd-creds   # move the Secret Key (systemd-creds: Linux, TPM2)
 onepw account touch-id on | off            # macOS only: Touch ID instead of the password
 ```
 
-- **Secret Key:** stored in the OS keychain under the service `onepw`: the macOS Keychain, or on Linux the **Secret Service** (GNOME Keyring, KWallet, KeePassXC), which is encrypted on disk and unlocked when you log in. Settings (address, email, device ID) go in `~/.config/onepw/config.json`. On servers without a Secret Service, set `ONEPW_SECRET_KEY` instead. (onepw 0.3.0 and earlier used the Linux kernel keyring, which is emptied on reboot; a key still there is moved to the Secret Service on first use.)
+- **Secret Key:** stored in the OS keychain under the service `onepw`: the macOS Keychain, or on Linux the **Secret Service** (GNOME Keyring, KWallet, KeePassXC), which is encrypted on disk and unlocked when you log in. Settings (address, email, device ID) go in `~/.config/onepw/config.json`. On Linux machines without a Secret Service (servers), use `onepw account add --store systemd-creds` (or `onepw account store systemd-creds`): the Secret Key goes in `~/.config/onepw/secret-key.cred`, encrypted by `systemd-creds --user` with a key bound to this machine's **TPM2** and host key, your user and the machine ID. It needs systemd 256 or later and a TPM2. The file is useless when copied elsewhere (another machine, a backup, another user), but like any keychain it doesn't stop programs running as you: they can ask systemd to decrypt it. Or set `ONEPW_SECRET_KEY`. (onepw 0.3.0 and earlier used the Linux kernel keyring, which is emptied on reboot; a key still there is moved to the Secret Service on first use.)
 - **Account password:** **never stored**. It's asked for (hidden) on every command, or read from `ONEPW_PASSWORD`. Keeping it next to the Secret Key would undo 1Password's two-secret design.
 - **Touch ID (macOS only):** `onepw account touch-id on` asks for the password once, then stores the *derived* unlock keys (not the password) and the Secret Key together in one Keychain item behind Touch ID, so each command reads one item behind one prompt. (Items made by 0.3.0 are upgraded on the next Touch ID sign-in.) The Secret Key also stays in its own keychain item, for the password fallback. Builds signed with a Developer ID and the right entitlement get a Secure Enclave-enforced item. Others get an item that only onepw reads, after its own Touch ID check. A cancelled prompt or out-of-date keys fall back to the password.
 - **`run`:** every environment variable, from your shell or from `--env-file` lines `KEY=op://vault/item/field`, whose value starts with `op://` is replaced before the command starts. The command's exit code is passed through. onepw's own `ONEPW_*` variables (password, Secret Key) are removed from the command's environment.
@@ -130,7 +131,7 @@ opts.identity.device_name = "my-backup-tool".into(); // shown in your account's 
 ```
 
 - **Device UUID.** Every sign-in identifies a *device*. A new UUID registers a new device in your account (and 1Password may email you about it). Generate one once with `onepw::client::new_device_uuid()`, store it, and reuse it.
-- **2FA.** If the account has authenticator-app 2FA, `totp` is called for the 6-digit code. **A wrong code ends the session**, so sign in again rather than retrying.
+- **2FA.** If the account has authenticator-app 2FA, `totp` is called for the 6-digit code. **A wrong code ends the session**, so sign in again rather than retrying: the error is `InvalidInput` "2FA code not accepted".
 - **Client identity.** 1Password's servers sit behind a firewall that turns away unfamiliar clients, so the request headers follow the format of 1Password's own desktop app (`ClientIdentity::default()`). The **device name** defaults to `onepw`, so you can always spot and revoke these sessions under *Settings → Devices* on 1Password.com.
 
 ### Reading data
