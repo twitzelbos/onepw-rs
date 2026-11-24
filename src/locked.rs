@@ -74,7 +74,7 @@ impl<const N: usize> Locked<N> {
     }
 
     /// Whether the OS agreed to lock the pages into RAM.
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "macos"))]
     pub fn is_locked(&self) -> bool {
         self.locked
     }
