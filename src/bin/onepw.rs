@@ -317,14 +317,18 @@ mod systemd_creds {
         super::config_path().with_file_name("secret-key.cred")
     }
 
-    /// Whether systemd reports a usable TPM2 (`systemd-creds has-tpm2` exits 0 only then).
+    /// Whether systemd reports a fully usable TPM2 (`has-tpm2` exits 0 only then; "partial"
+    /// is not enough). `systemd-analyze has-tpm2` replaced `systemd-creds has-tpm2` (still
+    /// redirected as of systemd 259), so try the new one first.
     fn has_tpm2() -> bool {
-        Command::new("systemd-creds")
-            .arg("has-tpm2")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success())
+        ["systemd-analyze", "systemd-creds"].iter().any(|tool| {
+            Command::new(tool)
+                .arg("has-tpm2")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+        })
     }
 
     /// Runs `systemd-creds --user --name=… <args>`, feeding `input` on stdin (never argv) and

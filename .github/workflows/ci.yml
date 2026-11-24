@@ -61,7 +61,7 @@ jobs:
         with:
           toolchain: stable
       - run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
-      - run: systemd-creds --version | head -1; systemd-creds has-tpm2 || true
+      - run: systemd-creds --version | head -1; systemd-analyze has-tpm2 || true
       - run: cargo test --locked --features cli --bin onepw -- --ignored --test-threads=1 systemd_creds
 
   # The minimum supported Rust version in Cargo.toml (rust-version) must keep building.
