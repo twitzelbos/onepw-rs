@@ -10,6 +10,11 @@
   ID. Needs systemd 256+ and a TPM2. `onepw account store keychain` moves it back.
 - OpenSSF Scorecard workflow and README badge.
 
+### Fixed
+- `Cargo.lock` no longer lists the never-built async Secret Service backend (`zbus`, `zvariant`,
+  flagged as unmaintained by RUSTSEC-2026-0370/0371/0372). The CLI now turns on D-Bus transfer
+  encryption on `dbus-secret-service` directly instead of through keyring's `crypto-rust`.
+
 ### Changed
 - A rejected 2FA code is reported as `InvalidInput` "2FA code not accepted" (the session has
   ended, so sign in again), instead of a bare `Server` 401 error.
