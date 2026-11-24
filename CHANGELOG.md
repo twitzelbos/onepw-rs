@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.2 (2026-11-24)
+
+### Changed
+- `sha2` 0.11.1 (fixes how round constants are loaded on AArch64, including Apple Silicon).
+- `num-bigint-dig` 0.9.1 (used only for public SRP values). Its 0.9 release moved to rand 0.9,
+  but only behind optional features (`std`, `prime`) that onepw doesn't enable. So the upgrade
+  adds no second copy of rand, and it drops the `spin` dependency.
+
 ## 0.3.1 (2026-11-24)
 
 ### Fixed
