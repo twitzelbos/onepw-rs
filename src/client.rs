@@ -1070,12 +1070,20 @@ async fn second_factor(
             Error::Unsupported("this account needs a 2FA code: set SignInOptions::totp".into())
         })?;
         let code = ask()?;
-        rest.post_discarding_reply(
+        return rest
+            .post_discarding_reply(
                 "v1/auth/mfa",
                 &json!({"sessionID": session_id, "client": opts.identity.client_id(), "totp": {"code": code.trim()}}),
             )
-            .await?;
-        return Ok(());
+            .await
+            .map_err(|e| match e {
+                Error::Server { status, body } => {
+                    Error::InvalidInput(format!(
+                        "2FA code not accepted; the session has ended, so sign in again (server: {status} {body})"
+                    ))
+                }
+                other => other,
+            });
     }
     let any = mfa.as_object().map(|m| {
         m.values()

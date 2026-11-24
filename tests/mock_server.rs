@@ -2,6 +2,7 @@
 //! variant), MAC checking on every authenticated request, session encryption of bodies, and a
 //! real encrypted keyset → vault key → item chain.
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use base64::Engine;
@@ -60,6 +61,15 @@ struct State {
     redirect_account: Option<String>,
     /// Answer `v1/account` with a body over the size limit.
     huge_account: bool,
+    /// Require an authenticator-app (TOTP) code, and this is the right one.
+    totp_code: Option<&'static str>,
+    /// Require a second factor onepw doesn't support (Duo).
+    duo_required: bool,
+    /// Requests to `v1/auth/mfa`, and whether one had the right code.
+    mfa_requests: u32,
+    mfa_passed: bool,
+    /// Requests to `v1/account/keysets` (the first thing after 2FA).
+    keysets_served: u32,
 }
 
 struct Fixture {
@@ -348,11 +358,46 @@ fn auth_complete(s: &Server, req: &Request) -> ResponseTemplate {
     let env: EncryptedObject = serde_json::from_slice(&req.body).unwrap();
     let body: Value = env.decrypt_json(&s.key()).unwrap();
     assert_eq!(body["device"]["name"], "onepw");
-    s.encrypted(&json!({"userUuid": "USER1", "accountUuid": "ACC1"}))
+    let st = s.state.lock().unwrap();
+    let mfa = json!({
+        "totp": {"enabled": st.totp_code.is_some()},
+        "duo": {"enabled": st.duo_required},
+    });
+    drop(st);
+    s.encrypted(&json!({"userUuid": "USER1", "accountUuid": "ACC1", "mfa": mfa}))
+}
+
+/// `v1/auth/mfa`: checks the TOTP code. Like the real server, later requests in the session are
+/// refused until the second factor is passed.
+fn auth_mfa(s: &Server, req: &Request) -> ResponseTemplate {
+    assert!(s.check_mac(req), "bad MAC on auth/mfa");
+    let env: EncryptedObject = serde_json::from_slice(&req.body).unwrap();
+    let body: Value = env.decrypt_json(&s.key()).unwrap();
+    assert_eq!(body["sessionID"], SESSION_ID);
+    assert!(
+        body["client"].as_str().is_some_and(|c| c.contains('/')),
+        "client name/version"
+    );
+    let mut st = s.state.lock().unwrap();
+    st.mfa_requests += 1;
+    if Some(body["totp"]["code"].as_str().unwrap()) != st.totp_code {
+        return ResponseTemplate::new(401)
+            .set_body_json(json!({"errorCode": 102, "errorMessage": "Incorrect code"}));
+    }
+    st.mfa_passed = true;
+    drop(st);
+    s.encrypted(&json!({}))
 }
 
 fn keysets(s: &Server, req: &Request) -> ResponseTemplate {
     assert!(s.check_mac(req), "bad MAC on keysets");
+    let mut st = s.state.lock().unwrap();
+    st.keysets_served += 1;
+    if (st.totp_code.is_some() || st.duo_required) && !st.mfa_passed {
+        return ResponseTemplate::new(401)
+            .set_body_json(json!({"errorCode": 102, "errorMessage": "Second factor required"}));
+    }
+    drop(st);
     s.encrypted(&s.fx.keysets)
 }
 
@@ -464,6 +509,16 @@ async fn setup() -> (MockServer, Arc<Mutex<State>>) {
     .await;
     mount(
         &server,
+        "POST",
+        "/api/v1/auth/mfa",
+        false,
+        &state,
+        &fx,
+        auth_mfa,
+    )
+    .await;
+    mount(
+        &server,
         "GET",
         "/api/v1/account/keysets",
         false,
@@ -500,6 +555,89 @@ fn opts(server: &MockServer) -> SignInOptions {
     o.base_url = Some(format!("{}/api/", server.uri()).parse().unwrap());
     o.min_kdf_iterations = 900; // the fixture uses few iterations (SRP 1000, AUK 900) to keep tests fast
     o
+}
+
+/// `opts` with a TOTP callback that returns `code` and counts its calls.
+fn opts_with_totp(server: &MockServer, code: &'static str) -> (SignInOptions, Arc<AtomicU32>) {
+    let calls = Arc::new(AtomicU32::new(0));
+    let c = calls.clone();
+    let mut o = opts(server);
+    o.totp = Some(Box::new(move || {
+        c.fetch_add(1, Ordering::SeqCst);
+        Ok(code.to_string())
+    }));
+    (o, calls)
+}
+
+#[tokio::test]
+async fn totp_code_is_sent_before_anything_else() {
+    let (server, state) = setup().await;
+    state.lock().unwrap().totp_code = Some("123456");
+    // Whitespace around the code (as typed) is trimmed.
+    let (o, calls) = opts_with_totp(&server, " 123456\n");
+    let account = Account::sign_in(&creds(PASSWORD), o)
+        .await
+        .expect("sign in with 2FA");
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "asked for the code once");
+    {
+        let st = state.lock().unwrap();
+        assert_eq!(st.mfa_requests, 1);
+        assert!(st.mfa_passed);
+        assert_eq!(st.keysets_served, 1, "keysets only fetched after 2FA");
+    }
+    assert_eq!(account.vaults().await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn totp_code_also_needed_with_saved_unlock_keys() {
+    let (server, state) = setup().await;
+    let keys = Account::sign_in(&creds(PASSWORD), opts(&server))
+        .await
+        .expect("sign in without 2FA")
+        .unlock_keys()
+        .clone();
+    state.lock().unwrap().totp_code = Some("654321");
+    let (o, calls) = opts_with_totp(&server, "654321");
+    let sk = SecretKey::parse(SECRET_KEY).unwrap();
+    Account::sign_in_with_keys(EMAIL, "unused", &sk, &keys, o)
+        .await
+        .expect("Touch ID-style sign-in with 2FA");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(state.lock().unwrap().mfa_passed);
+}
+
+#[tokio::test]
+async fn wrong_totp_code_fails_sign_in() {
+    let (server, state) = setup().await;
+    state.lock().unwrap().totp_code = Some("123456");
+    let (o, _) = opts_with_totp(&server, "000000");
+    let err = Account::sign_in(&creds(PASSWORD), o).await.unwrap_err();
+    assert!(matches!(err, onepw::Error::InvalidInput(_)), "{err}");
+    assert!(err.to_string().contains("2FA code not accepted"), "{err}");
+    let st = state.lock().unwrap();
+    assert_eq!(st.mfa_requests, 1);
+    assert_eq!(st.keysets_served, 0, "sign-in stops at the wrong code");
+}
+
+#[tokio::test]
+async fn missing_or_unsupported_second_factor_is_reported() {
+    // TOTP required, but no callback to ask for the code: fail before sending anything.
+    let (server, state) = setup().await;
+    state.lock().unwrap().totp_code = Some("123456");
+    let err = Account::sign_in(&creds(PASSWORD), opts(&server))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("needs a 2FA code"), "{err}");
+    assert_eq!(state.lock().unwrap().mfa_requests, 0);
+
+    // Only Duo: not supported, and no code is asked for.
+    let (server, state) = setup().await;
+    state.lock().unwrap().duo_required = true;
+    let (o, calls) = opts_with_totp(&server, "123456");
+    let err = Account::sign_in(&creds(PASSWORD), o).await.unwrap_err();
+    assert!(err.to_string().contains("only authenticator-app"), "{err}");
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert_eq!(state.lock().unwrap().keysets_served, 0);
 }
 
 #[tokio::test]
