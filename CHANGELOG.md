@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.3.1 (unreleased)
+
+### Fixed
+- **Linux: the CLI's Secret Key survives a reboot.** It's now stored in the Secret Service (GNOME
+  Keyring, KWallet, KeePassXC) instead of the kernel keyring, which is emptied on reboot. A key
+  still in the kernel keyring is moved over on first use. Building the CLI on Linux now needs the
+  D-Bus headers (`libdbus-1-dev`). Without a running Secret Service (headless servers), set
+  `ONEPW_SECRET_KEY`.
+
+### Changed
+- **Touch ID: one keychain item, one prompt.** The Secret Key is stored with the unlock keys in the
+  Touch ID item, so a sign-in reads one item instead of two (one macOS keychain prompt after a
+  rebuild instead of two, and at the Secure Enclave level the Secret Key is behind Touch ID too).
+  Items saved by 0.3.0 are upgraded on the next Touch ID sign-in.
+
+### Added
+- `touchid::save_with_secret_key`, `touchid::load_with_secret_key` and `touchid::Stored`. `save`
+  and `load` are unchanged.
+
 ## 0.3.0 (2026-11-24)
 
 A security release. Upgrading is strongly recommended: 0.2.0 and earlier accept unencrypted

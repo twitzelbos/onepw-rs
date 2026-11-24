@@ -6,6 +6,11 @@
 //! [`load`] + [`Account::sign_in_with_keys`](crate::Account::sign_in_with_keys), which brings up
 //! the Touch ID prompt instead of asking for the password.
 //!
+//! [`save_with_secret_key`] and [`load_with_secret_key`] keep the **Secret Key** in the same item,
+//! so a sign-in reads one keychain item behind one Touch ID prompt. Items saved by [`save`] (or by
+//! onepw 0.3.0 and earlier) have no Secret Key; [`load_with_secret_key`] then returns `None` for
+//! it, and you can re-save with the Secret Key to upgrade the item.
+//!
 //! Two protection levels, picked automatically:
 //!
 //! * [`Protection::Biometry`]: the item lives in the *data protection* keychain with a
@@ -31,6 +36,7 @@ use zeroize::Zeroizing;
 
 use crate::client::UnlockKeys;
 use crate::error::{Error, Result};
+use crate::secret_key::SecretKey;
 
 const SERVICE: &str = "onepw-unlock";
 /// `errSecMissingEntitlement`: the binary isn't signed with a keychain-access-groups entitlement.
@@ -48,6 +54,59 @@ pub enum Protection {
     Biometry,
     /// Touch ID checked by onepw, then an app-restricted (legacy) keychain item.
     TouchIdGate,
+}
+
+/// What [`load_with_secret_key`] found.
+#[derive(Debug)]
+pub struct Stored {
+    /// The keys that replace the password.
+    pub keys: UnlockKeys,
+    /// The Secret Key, if the item was saved with [`save_with_secret_key`].
+    pub secret_key: Option<SecretKey>,
+    /// How the item is protected.
+    pub protection: Protection,
+}
+
+/// Version byte of the item format that includes the Secret Key. The old format is exactly the
+/// 64 bytes of [`UnlockKeys::to_bytes`], with no version byte.
+const FORMAT_WITH_SECRET_KEY: u8 = 2;
+
+/// `keys` (and `secret_key`) as stored in the keychain item.
+fn encode(keys: &UnlockKeys, secret_key: Option<&SecretKey>) -> Zeroizing<Vec<u8>> {
+    let k = keys.to_bytes();
+    let mut out = Zeroizing::new(Vec::with_capacity(1 + 64 + 40));
+    match secret_key {
+        None => out.extend_from_slice(k.as_ref()),
+        Some(sk) => {
+            out.push(FORMAT_WITH_SECRET_KEY);
+            out.extend_from_slice(k.as_ref());
+            for part in [sk.format(), sk.account_id(), sk.secret()] {
+                out.extend_from_slice(part.as_bytes());
+            }
+        }
+    }
+    out
+}
+
+fn decode(bytes: &[u8]) -> Result<(UnlockKeys, Option<SecretKey>)> {
+    if bytes.len() == 64 {
+        return Ok((UnlockKeys::from_bytes(bytes)?, None));
+    }
+    match bytes.split_first() {
+        Some((&FORMAT_WITH_SECRET_KEY, rest)) if rest.len() > 64 => {
+            let keys = UnlockKeys::from_bytes(&rest[..64])?;
+            let text = Zeroizing::new(
+                std::str::from_utf8(&rest[64..])
+                    .map_err(|_| Error::Malformed("stored Secret Key is not text".into()))?
+                    .to_owned(),
+            );
+            Ok((keys, Some(SecretKey::parse(&text)?)))
+        }
+        _ => Err(Error::Malformed(format!(
+            "stored Touch ID item has an unknown format ({} bytes)",
+            bytes.len()
+        ))),
+    }
 }
 
 /// Whether Touch ID is available and has enrolled fingers.
@@ -111,7 +170,20 @@ fn biometry_options(account: &str) -> PasswordOptions {
 /// Tries [`Protection::Biometry`] first and falls back to [`Protection::TouchIdGate`] when the
 /// binary isn't entitled. Returns the protection that was used.
 pub fn save(account: &str, keys: &UnlockKeys) -> Result<Protection> {
-    let bytes = keys.to_bytes();
+    store(account, &encode(keys, None))
+}
+
+/// Like [`save`], and also stores the Secret Key in the same item, so [`load_with_secret_key`]
+/// needs only this one item.
+pub fn save_with_secret_key(
+    account: &str,
+    keys: &UnlockKeys,
+    secret_key: &SecretKey,
+) -> Result<Protection> {
+    store(account, &encode(keys, Some(secret_key)))
+}
+
+fn store(account: &str, bytes: &[u8]) -> Result<Protection> {
     let _ = delete(account);
 
     let mut o = biometry_options(account);
@@ -123,23 +195,36 @@ pub fn save(account: &str, keys: &UnlockKeys) -> Result<Protection> {
     )
     .map_err(|e| Error::Protocol(format!("keychain access control: {e}")))?;
     o.set_access_control(access);
-    match passwords::set_generic_password_options(bytes.as_ref(), o) {
+    match passwords::set_generic_password_options(bytes, o) {
         Ok(()) => return Ok(Protection::Biometry),
         Err(e) if e.code() == ERR_MISSING_ENTITLEMENT => {}
         Err(e) => return Err(Error::Protocol(format!("keychain: {e}"))),
     }
-    passwords::set_generic_password(SERVICE, account, bytes.as_ref())
+    passwords::set_generic_password(SERVICE, account, bytes)
         .map_err(|e| Error::Protocol(format!("keychain: {e}")))?;
     Ok(Protection::TouchIdGate)
 }
 
-/// Loads the keys for `account`, showing the Touch ID prompt with `reason`.
+/// Loads the keys for `account`, showing the Touch ID prompt with `reason`. A stored Secret Key is
+/// ignored (see [`load_with_secret_key`]).
 pub fn load(account: &str, reason: &str) -> Result<(UnlockKeys, Protection)> {
+    let s = load_with_secret_key(account, reason)?;
+    Ok((s.keys, s.protection))
+}
+
+/// Loads the keys and, if it was saved with them, the Secret Key for `account`, showing the
+/// Touch ID prompt with `reason`.
+pub fn load_with_secret_key(account: &str, reason: &str) -> Result<Stored> {
     // Secure Enclave item: the system shows the Touch ID prompt itself.
     match passwords::generic_password(biometry_options(account)) {
         Ok(b) => {
             let b = Zeroizing::new(b);
-            return Ok((UnlockKeys::from_bytes(&b)?, Protection::Biometry));
+            let (keys, secret_key) = decode(&b)?;
+            return Ok(Stored {
+                keys,
+                secret_key,
+                protection: Protection::Biometry,
+            });
         }
         Err(e) if e.code() == ERR_CANCELED || e.code() == ERR_AUTH_FAILED => {
             return Err(Error::InvalidInput(
@@ -161,7 +246,12 @@ pub fn load(account: &str, reason: &str) -> Result<(UnlockKeys, Protection)> {
     match passwords::get_generic_password(SERVICE, account) {
         Ok(b) => {
             let b = Zeroizing::new(b);
-            Ok((UnlockKeys::from_bytes(&b)?, Protection::TouchIdGate))
+            let (keys, secret_key) = decode(&b)?;
+            Ok(Stored {
+                keys,
+                secret_key,
+                protection: Protection::TouchIdGate,
+            })
         }
         Err(e) if e.code() == ERR_NOT_FOUND => Err(Error::InvalidInput(
             "Touch ID unlock is not set up for this account".into(),
@@ -190,5 +280,50 @@ pub fn delete(account: &str) -> Result<()> {
         Ok(())
     } else {
         Err(Error::InvalidInput("nothing stored".into()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SK: &str = "A3-8MMQJN-MZ64CY-2SDB4-RPX3T-V52Q3-N2C84";
+
+    fn keys() -> UnlockKeys {
+        let b: Vec<u8> = (0..64).collect();
+        UnlockKeys::from_bytes(&b).unwrap()
+    }
+
+    #[test]
+    fn item_format_round_trips_with_and_without_secret_key() {
+        let old = encode(&keys(), None);
+        assert_eq!(old.len(), 64, "the 0.3.0 format is unchanged");
+        let (k, sk) = decode(&old).unwrap();
+        assert_eq!(*k.to_bytes(), *keys().to_bytes());
+        assert!(sk.is_none());
+
+        let sk = SecretKey::parse(SK).unwrap();
+        let new = encode(&keys(), Some(&sk));
+        assert_eq!(new[0], FORMAT_WITH_SECRET_KEY);
+        let (k, back) = decode(&new).unwrap();
+        assert_eq!(*k.to_bytes(), *keys().to_bytes());
+        let back = back.unwrap();
+        assert_eq!(
+            (back.format(), back.account_id(), back.secret()),
+            (sk.format(), sk.account_id(), sk.secret())
+        );
+    }
+
+    #[test]
+    fn unknown_item_formats_are_refused() {
+        assert!(decode(&[]).is_err());
+        assert!(decode(&[0u8; 63]).is_err());
+        assert!(
+            decode(&[FORMAT_WITH_SECRET_KEY; 65]).is_err(),
+            "too short for keys + key"
+        );
+        let mut bad = encode(&keys(), Some(&SecretKey::parse(SK).unwrap()));
+        bad[0] = 3;
+        assert!(decode(&bad).is_err(), "unknown version");
     }
 }

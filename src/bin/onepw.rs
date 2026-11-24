@@ -170,9 +170,59 @@ fn load_config() -> Result<Config, String> {
     serde_json::from_str(&s).map_err(|e| format!("{}: {e}", p.display()))
 }
 
+/// The Secret Key's keychain entry: the macOS Keychain, or on Linux the Secret Service (GNOME
+/// Keyring, KWallet, KeePassXC …).
 fn keychain(cfg_email: &str, address: &str) -> Result<keyring::Entry, String> {
     keyring::Entry::new(KEYCHAIN_SERVICE, &account_label(cfg_email, address))
         .map_err(|e| format!("keychain: {e}"))
+}
+
+/// Where onepw 0.3.0 and earlier kept the Secret Key on Linux: the kernel keyring, which is
+/// emptied on reboot. Only read to move a key to the Secret Service, and cleared by `forget`.
+#[cfg(target_os = "linux")]
+fn old_kernel_keyring(cfg_email: &str, address: &str) -> Result<keyring::Entry, String> {
+    let c = keyring::keyutils::KeyutilsCredential::new_with_target(
+        None,
+        KEYCHAIN_SERVICE,
+        &account_label(cfg_email, address),
+    )
+    .map_err(|e| format!("kernel keyring: {e}"))?;
+    Ok(keyring::Entry::new_with_credential(Box::new(c)))
+}
+
+/// The Secret Key: `ONEPW_SECRET_KEY`, else the keychain.
+fn secret_key_text(cfg: &Config) -> Result<Zeroizing<String>, String> {
+    if let Ok(s) = std::env::var("ONEPW_SECRET_KEY") {
+        return Ok(Zeroizing::new(s));
+    }
+    let entry = keychain(&cfg.email, &cfg.address)?;
+    match entry.get_password() {
+        Ok(s) => Ok(Zeroizing::new(s)),
+        #[cfg(target_os = "linux")]
+        Err(keyring::Error::NoEntry) => {
+            let old = old_kernel_keyring(&cfg.email, &cfg.address)?;
+            let s = Zeroizing::new(old.get_password().map_err(|_| no_secret_key(None))?);
+            entry
+                .set_password(&s)
+                .map_err(|e| format!("Secret Service: {e}"))?;
+            let _ = old.delete_credential();
+            eprintln!("onepw: moved the Secret Key from the kernel keyring to the Secret Service");
+            Ok(s)
+        }
+        #[cfg(not(target_os = "linux"))]
+        Err(keyring::Error::NoEntry) => Err(no_secret_key(None)),
+        Err(e) => Err(no_secret_key(Some(&e))),
+    }
+}
+
+fn no_secret_key(e: Option<&keyring::Error>) -> String {
+    match e {
+        None => "Secret Key not in the keychain: run `onepw account add`".into(),
+        Some(e) => format!(
+            "cannot read the Secret Key from the keychain ({e}). On Linux this needs a running \
+             Secret Service (GNOME Keyring, KWallet, KeePassXC); without one, set ONEPW_SECRET_KEY"
+        ),
+    }
 }
 
 fn prompt(label: &str, default: Option<&str>) -> io::Result<String> {
@@ -223,30 +273,48 @@ async fn sign_in() -> Result<Account, String> {
 /// password sign-in with Touch ID enabled, the stored keys are refreshed (e.g. after a password
 /// change).
 async fn sign_in_with(cfg: &Config, force_password: bool) -> Result<Account, String> {
-    let sk =
-        match std::env::var("ONEPW_SECRET_KEY") {
-            Ok(s) => Zeroizing::new(s),
-            Err(_) => Zeroizing::new(keychain(&cfg.email, &cfg.address)?.get_password().map_err(
-                |e| format!("Secret Key not in keychain ({e}): run `onepw account add`"),
-            )?),
-        };
-    let secret_key = SecretKey::parse(&sk).map_err(|e| e.to_string())?;
+    Ok(sign_in_full(cfg, force_password).await?.0)
+}
 
+/// [`sign_in_with`], also returning the Secret Key that was used.
+async fn sign_in_full(cfg: &Config, force_password: bool) -> Result<(Account, SecretKey), String> {
     #[cfg(all(feature = "touchid", target_os = "macos"))]
     if cfg.touch_id && !force_password && std::env::var("ONEPW_PASSWORD").is_err() {
-        match onepw::touchid::load(&cfg.label(), "unlock your 1Password account") {
-            Ok((keys, _)) => {
-                match Account::sign_in_with_keys(
-                    &cfg.email,
-                    &cfg.address,
-                    &secret_key,
-                    &keys,
-                    options(cfg.device_uuid.clone()),
-                )
-                .await
-                {
-                    Ok(a) => return Ok(a),
-                    Err(e) => eprintln!("onepw: {e}"),
+        // One item behind one Touch ID prompt holds the unlock keys and the Secret Key.
+        match onepw::touchid::load_with_secret_key(&cfg.label(), "unlock your 1Password account") {
+            Ok(stored) => {
+                let from_env = std::env::var_os("ONEPW_SECRET_KEY").is_some();
+                // Items saved by 0.3.0 and earlier have no Secret Key: read it from the keychain
+                // this once, then upgrade the item.
+                let upgrade = stored.secret_key.is_none() && !from_env;
+                let secret_key = match stored.secret_key {
+                    Some(sk) if !from_env => Ok(sk),
+                    _ => secret_key_text(cfg)
+                        .and_then(|t| SecretKey::parse(&t).map_err(|e| e.to_string())),
+                };
+                match secret_key {
+                    Ok(secret_key) => match Account::sign_in_with_keys(
+                        &cfg.email,
+                        &cfg.address,
+                        &secret_key,
+                        &stored.keys,
+                        options(cfg.device_uuid.clone()),
+                    )
+                    .await
+                    {
+                        Ok(a) => {
+                            if upgrade {
+                                let _ = onepw::touchid::save_with_secret_key(
+                                    &cfg.label(),
+                                    &stored.keys,
+                                    &secret_key,
+                                );
+                            }
+                            return Ok((a, secret_key));
+                        }
+                        Err(e) => eprintln!("onepw: {e}"),
+                    },
+                    Err(e) => return Err(e),
                 }
             }
             Err(e) => eprintln!("onepw: {e}; using the password instead"),
@@ -254,10 +322,11 @@ async fn sign_in_with(cfg: &Config, force_password: bool) -> Result<Account, Str
     }
     let _ = force_password;
 
+    let sk = secret_key_text(cfg)?;
     let creds = Credentials {
         email: cfg.email.clone(),
         password: password()?,
-        secret_key,
+        secret_key: SecretKey::parse(&sk).map_err(|e| e.to_string())?,
         sign_in_address: cfg.address.clone(),
     };
     let account = Account::sign_in(&creds, options(cfg.device_uuid.clone()))
@@ -265,9 +334,13 @@ async fn sign_in_with(cfg: &Config, force_password: bool) -> Result<Account, Str
         .map_err(|e| format!("sign-in failed: {e}"))?;
     #[cfg(all(feature = "touchid", target_os = "macos"))]
     if cfg.touch_id {
-        let _ = onepw::touchid::save(&cfg.label(), account.unlock_keys());
+        let _ = onepw::touchid::save_with_secret_key(
+            &cfg.label(),
+            account.unlock_keys(),
+            &creds.secret_key,
+        );
     }
-    Ok(account)
+    Ok((account, creds.secret_key))
 }
 
 /// Caches vaults and per-vault items so several references cost one download each.
@@ -404,6 +477,10 @@ async fn run(cli: Cli) -> Result<i32, String> {
         Cmd::Account(AccountCmd::Forget) => {
             let c = load_config()?;
             let _ = keychain(&c.email, &c.address)?.delete_credential();
+            #[cfg(target_os = "linux")]
+            if let Ok(old) = old_kernel_keyring(&c.email, &c.address) {
+                let _ = old.delete_credential();
+            }
             #[cfg(all(feature = "touchid", target_os = "macos"))]
             let _ = onepw::touchid::delete(&c.label());
             let _ = std::fs::remove_file(config_path());
@@ -420,9 +497,13 @@ async fn run(cli: Cli) -> Result<i32, String> {
                         return Err("Touch ID isn't available on this Mac (no sensor, or no enrolled finger)".into());
                     }
                     eprintln!("Sign in once with your password to set up Touch ID…");
-                    let account = sign_in_with(&cfg, true).await?;
-                    let protection = onepw::touchid::save(&cfg.label(), account.unlock_keys())
-                        .map_err(|e| e.to_string())?;
+                    let (account, secret_key) = sign_in_full(&cfg, true).await?;
+                    let protection = onepw::touchid::save_with_secret_key(
+                        &cfg.label(),
+                        account.unlock_keys(),
+                        &secret_key,
+                    )
+                    .map_err(|e| e.to_string())?;
                     let _ = account.sign_out().await;
                     cfg.touch_id = true;
                     cfg.save()?;
@@ -703,5 +784,43 @@ impl io::Write for WipingBuf {
 
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
+    }
+}
+
+/// Needs a running, unlocked Secret Service and the kernel keyring, so it's ignored by default;
+/// CI runs it in the `linux-keychain` job (gnome-keyring in a private D-Bus session).
+#[cfg(all(test, target_os = "linux"))]
+mod linux_keychain_tests {
+    use super::*;
+
+    #[test]
+    #[ignore]
+    fn secret_key_moves_from_kernel_keyring_to_secret_service() {
+        assert!(std::env::var_os("ONEPW_SECRET_KEY").is_none());
+        let cfg = Config {
+            address: "ci.1password.com".into(),
+            email: "ci@example.com".into(),
+            device_uuid: String::new(),
+            touch_id: false,
+        };
+        let sk = "A3-8MMQJN-MZ64CY-2SDB4-RPX3T-V52Q3-N2C84";
+        let service = keychain(&cfg.email, &cfg.address).unwrap();
+        let old = old_kernel_keyring(&cfg.email, &cfg.address).unwrap();
+        let _ = service.delete_credential();
+        old.set_password(sk).unwrap();
+
+        // First read moves the key; the kernel copy is gone, the Secret Service has it.
+        assert_eq!(secret_key_text(&cfg).unwrap().as_str(), sk);
+        assert!(matches!(old.get_password(), Err(keyring::Error::NoEntry)));
+        assert_eq!(service.get_password().unwrap(), sk);
+        // Later reads come straight from the Secret Service.
+        assert_eq!(secret_key_text(&cfg).unwrap().as_str(), sk);
+
+        service.delete_credential().unwrap();
+        assert!(
+            secret_key_text(&cfg)
+                .unwrap_err()
+                .contains("onepw account add")
+        );
     }
 }

@@ -87,6 +87,9 @@ It prompts for the sign-in address, email, Secret Key and password (the last two
 cargo install onepw --features cli
 ```
 
+On Linux the build needs the D-Bus headers: `sudo apt install libdbus-1-dev pkg-config` (Debian,
+Ubuntu) or `sudo dnf install dbus-devel pkgconf` (Fedora).
+
 ```sh
 onepw account add                          # one-time: address, email, Secret Key (→ OS keychain); checks sign-in
 onepw vault list
@@ -98,9 +101,9 @@ onepw account show | forget
 onepw account touch-id on | off            # macOS only: Touch ID instead of the password
 ```
 
-- **Secret Key:** stored in the macOS Keychain (or the Linux kernel keyring) under the service `onepw`. Settings (address, email, device ID) go in `~/.config/onepw/config.json`. You can also set `ONEPW_SECRET_KEY`.
+- **Secret Key:** stored in the OS keychain under the service `onepw`: the macOS Keychain, or on Linux the **Secret Service** (GNOME Keyring, KWallet, KeePassXC), which is encrypted on disk and unlocked when you log in. Settings (address, email, device ID) go in `~/.config/onepw/config.json`. On servers without a Secret Service, set `ONEPW_SECRET_KEY` instead. (onepw 0.3.0 and earlier used the Linux kernel keyring, which is emptied on reboot; a key still there is moved to the Secret Service on first use.)
 - **Account password:** **never stored**. It's asked for (hidden) on every command, or read from `ONEPW_PASSWORD`. Keeping it next to the Secret Key would undo 1Password's two-secret design.
-- **Touch ID (macOS only):** `onepw account touch-id on` asks for the password once, then stores the *derived* unlock keys (not the password) in the Keychain behind Touch ID. Builds signed with a Developer ID and the right entitlement get a Secure Enclave-enforced item. Others get an item that only onepw reads, after its own Touch ID check. A cancelled prompt or out-of-date keys fall back to the password.
+- **Touch ID (macOS only):** `onepw account touch-id on` asks for the password once, then stores the *derived* unlock keys (not the password) and the Secret Key together in one Keychain item behind Touch ID, so each command reads one item behind one prompt. (Items made by 0.3.0 are upgraded on the next Touch ID sign-in.) The Secret Key also stays in its own keychain item, for the password fallback. Builds signed with a Developer ID and the right entitlement get a Secure Enclave-enforced item. Others get an item that only onepw reads, after its own Touch ID check. A cancelled prompt or out-of-date keys fall back to the password.
 - **`run`:** every environment variable, from your shell or from `--env-file` lines `KEY=op://vault/item/field`, whose value starts with `op://` is replaced before the command starts. The command's exit code is passed through. onepw's own `ONEPW_*` variables (password, Secret Key) are removed from the command's environment.
 - **Cost:** each command is a full sign-in (≈1 s, mostly the 650 000-round key derivation). `run` resolves all references with one sign-in.
 
@@ -223,7 +226,7 @@ Read this before relying on onepw for anything sensitive. Memory wiping reduces 
 | **Shell history** | `op://` references are not secret, but a value you paste on the command line is | Never type secret values on the command line |
 | **Malware running as your user** | It can attach a debugger, read process memory, read the Keychain items it is allowed to, or log keystrokes. No in-process protection stops that | Keep your machine clean; a signed build with the hardened runtime and the Secure Enclave level raises the bar |
 | **A malicious or compromised 1Password server** | It can offer you vaults and items it made (encrypted to your public key, which isn't secret) or swap encrypted parts between items: 1Password's format doesn't tie an item's ciphertext to its ID. onepw doesn't yet remember keys it has seen | Use UUIDs in `op://` references for anything important |
-| **Touch ID fallback level** | On unsigned builds (`Protection::TouchIdGate`), Touch ID is checked by onepw, not enforced by the hardware. Malware running as you can launch the (trusted) onepw binary with an injected library, since unsigned builds have no hardened runtime, and read the stored unlock keys without any prompt | Use a signed build for the Secure Enclave level (`Protection::Biometry`) |
+| **Touch ID fallback level** | On unsigned builds (`Protection::TouchIdGate`), Touch ID is checked by onepw, not enforced by the hardware. Malware running as you can launch the (trusted) onepw binary with an injected library, since unsigned builds have no hardened runtime, and read the stored unlock keys and Secret Key without any prompt | Use a signed build for the Secure Enclave level (`Protection::Biometry`) |
 | **Remaining timing leak in SRP** | `K = SHA256(hex(S))` strips leading zero digits of `S`, as 1Password's protocol requires, which can reveal how many leading zeros `S` has | None (protocol-defined) |
 | **Several fields with the same label** | `item.field("x")` / `op://…/x` returns the first matching field (top-level, then sections) without an ambiguity check | Check the item in 1Password if a label is reused |
 | **No professional audit** | onepw has had an automated, independent code review (findings fixed in 0.3.0) and fuzzing, but **no** professional security audit | Treat it accordingly |
