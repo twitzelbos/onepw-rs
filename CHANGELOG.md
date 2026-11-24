@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.3.1 (unreleased)
+## 0.3.1 (2026-11-24)
 
 ### Fixed
 - **Linux: the CLI's Secret Key survives a reboot.** It's now stored in the Secret Service (GNOME
