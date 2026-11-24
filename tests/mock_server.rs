@@ -6,11 +6,11 @@ use std::sync::{Arc, Mutex};
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use num_bigint_dig::{BigUint, RandBigInt};
+use num_bigint_dig::BigUint;
 use onepw::keys::{EncryptedObject, SymmetricKey};
 use onepw::{Account, Credentials, SecretKey, SignInOptions, kdf, mac, srp};
 use rsa::traits::{PrivateKeyParts, PublicKeyParts};
-use rsa::{Oaep, RsaPrivateKey};
+use rsa::{Oaep, PrivateKey as RsaPrivateKey};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use wiremock::matchers::{method, path, path_regex};
@@ -28,6 +28,14 @@ fn b64(b: &[u8]) -> String {
 fn unb64(s: &str) -> Vec<u8> {
     URL_SAFE_NO_PAD.decode(s.trim_end_matches('=')).unwrap()
 }
+/// A uniformly random integer of `bits` bits (test helper).
+fn random_biguint(bits: usize) -> BigUint {
+    use rand::Rng;
+    let mut b = vec![0u8; bits.div_ceil(8)];
+    rand::rng().fill_bytes(&mut b);
+    BigUint::from_bytes_be(&b)
+}
+
 fn pad(n: &BigUint, v: &BigUint) -> Vec<u8> {
     let len = n.bits().div_ceil(8);
     let bytes = (v % n).to_bytes_be();
@@ -46,6 +54,12 @@ struct State {
     confirmed: bool,
     last_request_id: Option<u32>,
     macs_checked: u32,
+    /// Simulate an interceptor: answer `v1/account` in plaintext.
+    plaintext_account: bool,
+    /// Answer `v1/account` with a redirect to this URL.
+    redirect_account: Option<String>,
+    /// Answer `v1/account` with a body over the size limit.
+    huge_account: bool,
 }
 
 struct Fixture {
@@ -58,7 +72,7 @@ struct Fixture {
 
 fn fixture() -> Fixture {
     let sk = SecretKey::parse(SECRET_KEY).unwrap();
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
 
     // SRP verifier for the account.
     let srp_salt = vec![5u8; 16];
@@ -70,13 +84,13 @@ fn fixture() -> Fixture {
 
     // Keyset: sym key encrypted by the AUK, RSA key encrypted by the sym key.
     let p2s = vec![6u8; 16];
-    let auk = kdf::account_unlock_key(PASSWORD, &sk, EMAIL, "PBES2g-HS256", &p2s, 1000).unwrap();
+    let auk = kdf::account_unlock_key(PASSWORD, &sk, EMAIL, "PBES2g-HS256", &p2s, 900).unwrap();
     let ks_uuid = "c4pxet7agzqqhqg9yvxc2hkg8g";
     let sym = SymmetricKey::new(ks_uuid, [2u8; 32]);
     let rsa = RsaPrivateKey::new(&mut rng, 2048).unwrap();
-    let e = |n: &rsa::BigUint| b64(&n.to_bytes_be());
-    let pri_jwk = json!({"kty":"RSA","kid":ks_uuid,"alg":"RSA-OAEP-256","n":e(rsa.n()),"e":e(rsa.e()),
-        "d":e(rsa.d()),"p":e(&rsa.primes()[0]),"q":e(&rsa.primes()[1])});
+    let e = |n: &rsa::BoxedUint| b64(&n.to_be_bytes_trimmed_vartime());
+    let pri_jwk = json!({"kty":"RSA","kid":ks_uuid,"alg":"RSA-OAEP-256","n":e(rsa.n().as_ref()),"e":e(rsa.e()),
+        "d":e(rsa.d()),"p":e(rsa.primes()[0].as_ref()),"q":e(rsa.primes()[1].as_ref())});
     let sym_jwk = json!({"kty":"oct","alg":"A256GCM","kid":ks_uuid,"k":b64(sym.as_bytes())});
     let mut enc_sym = serde_json::to_value(EncryptedObject::encrypt(
         &auk,
@@ -86,21 +100,21 @@ fn fixture() -> Fixture {
     .unwrap();
     enc_sym["alg"] = "PBES2g-HS256".into();
     enc_sym["p2s"] = b64(&p2s).into();
-    enc_sym["p2c"] = 1000.into();
+    enc_sym["p2c"] = 900.into(); // differs from the SRP count (1000) so each check is tested
     let enc_pri = EncryptedObject::encrypt(&sym, "b5+jwk+json", pri_jwk.to_string().as_bytes());
     // A second (group-style) keyset whose symmetric key is RSA-OAEP-wrapped by the first one,
     // as on real accounts. It holds the key of a second, shared vault.
     let g_uuid = "groupkeyset0000000000000000";
     let g_sym = SymmetricKey::new(g_uuid, [4u8; 32]);
     let g_rsa = RsaPrivateKey::new(&mut rng, 2048).unwrap();
-    let g_pri_jwk = json!({"kty":"RSA","kid":g_uuid,"alg":"RSA-OAEP-256","n":e(g_rsa.n()),"e":e(g_rsa.e()),
-        "d":e(g_rsa.d()),"p":e(&g_rsa.primes()[0]),"q":e(&g_rsa.primes()[1])});
+    let g_pri_jwk = json!({"kty":"RSA","kid":g_uuid,"alg":"RSA-OAEP-256","n":e(g_rsa.n().as_ref()),"e":e(g_rsa.e()),
+        "d":e(g_rsa.d()),"p":e(g_rsa.primes()[0].as_ref()),"q":e(g_rsa.primes()[1].as_ref())});
     let g_sym_jwk = json!({"kty":"oct","alg":"A256GCM","kid":g_uuid,"k":b64(g_sym.as_bytes())});
     let g_wrapped = rsa
         .to_public_key()
         .encrypt(
             &mut rng,
-            Oaep::new::<sha1::Sha1>(),
+            Oaep::<sha1::Sha1>::new(),
             g_sym_jwk.to_string().as_bytes(),
         )
         .unwrap();
@@ -119,7 +133,7 @@ fn fixture() -> Fixture {
         .to_public_key()
         .encrypt(
             &mut rng,
-            Oaep::new::<sha2::Sha256>(),
+            Oaep::<sha2::Sha256>::new(),
             shared_jwk.to_string().as_bytes(),
         )
         .unwrap();
@@ -132,7 +146,7 @@ fn fixture() -> Fixture {
         .to_public_key()
         .encrypt(
             &mut rng,
-            Oaep::new::<sha1::Sha1>(),
+            Oaep::<sha1::Sha1>::new(),
             vk_jwk.to_string().as_bytes(),
         )
         .unwrap();
@@ -271,7 +285,7 @@ fn srp_auth(s: &Server, req: &Request) -> ResponseTemplate {
     let body: Value = serde_json::from_slice(&req.body).unwrap();
     let g = srp::rfc5054_4096();
     let big_a = srp::from_server_hex(body["userA"].as_str().unwrap()).unwrap();
-    let b = rand::thread_rng().gen_biguint(256);
+    let b = random_biguint(256);
     let v = &s.fx.verifier;
     let big_b = ((g.standard_k() * v) % g.n() + g.g().modpow(&b, g.n())) % g.n();
     let mut h = Sha256::new();
@@ -344,6 +358,17 @@ fn keysets(s: &Server, req: &Request) -> ResponseTemplate {
 
 fn account(s: &Server, req: &Request) -> ResponseTemplate {
     assert!(s.check_mac(req), "bad MAC on account");
+    let st = s.state.lock().unwrap();
+    if st.plaintext_account {
+        return ResponseTemplate::new(200).set_body_json(&s.fx.account);
+    }
+    if let Some(to) = &st.redirect_account {
+        return ResponseTemplate::new(302).insert_header("Location", to.as_str());
+    }
+    if st.huge_account {
+        return ResponseTemplate::new(200).set_body_string("x".repeat((64 << 20) + 1));
+    }
+    drop(st);
     s.encrypted(&s.fx.account)
 }
 
@@ -473,7 +498,78 @@ async fn setup() -> (MockServer, Arc<Mutex<State>>) {
 fn opts(server: &MockServer) -> SignInOptions {
     let mut o = SignInOptions::new();
     o.base_url = Some(format!("{}/api/", server.uri()).parse().unwrap());
+    o.min_kdf_iterations = 900; // the fixture uses few iterations (SRP 1000, AUK 900) to keep tests fast
     o
+}
+
+#[tokio::test]
+async fn plaintext_response_after_sign_in_is_refused() {
+    let (server, state) = setup().await;
+    let account = Account::sign_in(&creds(PASSWORD), opts(&server))
+        .await
+        .expect("sign in");
+    state.lock().unwrap().plaintext_account = true;
+    let err = account.vaults().await.unwrap_err();
+    assert!(err.to_string().contains("not encrypted"), "{err}");
+}
+
+#[tokio::test]
+async fn redirects_are_not_followed() {
+    let (server, state) = setup().await;
+    let elsewhere = MockServer::start().await;
+    Mock::given(wiremock::matchers::any())
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .expect(0) // verified when `elsewhere` is dropped
+        .mount(&elsewhere)
+        .await;
+    let account = Account::sign_in(&creds(PASSWORD), opts(&server))
+        .await
+        .expect("sign in");
+    state.lock().unwrap().redirect_account = Some(format!("{}/api/v1/account", elsewhere.uri()));
+    let err = account.vaults().await.unwrap_err();
+    assert!(err.to_string().contains("302"), "{err}");
+}
+
+#[tokio::test]
+async fn oversized_response_is_refused() {
+    let (server, state) = setup().await;
+    let account = Account::sign_in(&creds(PASSWORD), opts(&server))
+        .await
+        .expect("sign in");
+    state.lock().unwrap().huge_account = true;
+    let err = account.vaults().await.unwrap_err();
+    assert!(err.to_string().contains("too large"), "{err}");
+}
+
+#[tokio::test]
+async fn non_onepassword_address_is_refused() {
+    let mut o = SignInOptions::new();
+    o.min_kdf_iterations = 1000;
+    let mut c = creds(PASSWORD);
+    c.sign_in_address = "my.1passw0rd.com".into();
+    let err = Account::sign_in(&c, o).await.unwrap_err();
+    assert!(err.to_string().contains("not a 1Password domain"), "{err}");
+}
+
+#[tokio::test]
+async fn low_account_unlock_key_iterations_are_refused() {
+    let (server, _state) = setup().await;
+    let mut o = opts(&server);
+    o.min_kdf_iterations = 950; // SRP's 1000 passes, the AUK's 900 must not
+    let err = Account::sign_in(&creds(PASSWORD), o).await.unwrap_err();
+    assert!(
+        err.to_string().contains("900 key-derivation iterations"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn low_kdf_iteration_count_is_refused() {
+    let (server, _state) = setup().await;
+    let mut o = opts(&server);
+    o.min_kdf_iterations = onepw::client::MIN_KDF_ITERATIONS; // fixture sends 1000
+    let err = Account::sign_in(&creds(PASSWORD), o).await.unwrap_err();
+    assert!(err.to_string().contains("iterations"), "{err}");
 }
 
 #[tokio::test]
@@ -502,8 +598,24 @@ async fn full_sign_in_and_read() {
     let items = account.items(&vaults[0]).await.unwrap();
     assert_eq!(items.len(), 3);
     let gh = items.iter().find(|i| i.title() == "GitHub").unwrap();
-    assert_eq!(gh.field("username"), Some("patty"));
-    assert_eq!(gh.field("password"), Some("hunter2"));
+    let field = |name: &str| gh.field(name).unwrap().map(|v| v.to_string());
+    assert_eq!(field("username").as_deref(), Some("patty"));
+    assert_eq!(field("password").as_deref(), Some("hunter2"));
+    assert_eq!(field("nope"), None);
+
+    // Secrets never show up in Debug output.
+    let fields = gh.fields().unwrap();
+    assert!(fields.iter().any(|f| f.value.as_str() == "hunter2"));
+    for dbg in [
+        format!("{gh:?}"),
+        format!("{fields:?}"),
+        format!("{:?}", gh.details().unwrap()),
+        format!("{items:?}"),
+    ] {
+        assert!(!dbg.contains("hunter2"), "secret leaked in Debug: {dbg}");
+        assert!(!dbg.contains("patty"), "value leaked in Debug: {dbg}");
+    }
+    assert!(format!("{gh:?}").contains("GitHub"));
 
     let key = account
         .read("op://Private/Anthropic API/credential")

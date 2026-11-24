@@ -47,6 +47,10 @@ enum Cmd {
     #[command(subcommand)]
     Item(ItemCmd),
     /// Print one secret: `onepw read op://Private/GitHub/password`.
+    ///
+    /// The value ends up wherever stdout goes (terminal scrollback, tmux history, a file).
+    /// Prefer `onepw run`, or piping it straight into the program that needs it (the clipboard
+    /// is no safer: clipboard-history tools keep copies).
     Read {
         /// Secret reference op://<vault>/<item>/<field>.
         reference: String,
@@ -55,6 +59,9 @@ enum Cmd {
         no_newline: bool,
     },
     /// Run a command with every `op://…` environment value replaced by the secret.
+    ///
+    /// Secrets are passed as environment variables: the command and everything it starts
+    /// inherits them, and some programs log their environment. Only run programs you trust.
     Run {
         /// Extra KEY=VALUE lines to load (values may be op:// references). Repeatable.
         #[arg(long = "env-file")]
@@ -113,7 +120,8 @@ enum ItemCmd {
         /// Only look in this vault (name or UUID).
         #[arg(long)]
         vault: Option<String>,
-        /// Show concealed values (passwords, credentials).
+        /// Show concealed values (passwords, credentials). They stay in your terminal's
+        /// scrollback (and tmux history) afterwards.
         #[arg(long)]
         reveal: bool,
         /// Print the item as JSON (concealed values still need --reveal).
@@ -308,19 +316,10 @@ impl<'a> Cache<'a> {
         let vaults = self.vaults().await?.to_vec();
         match filter {
             None => Ok(vaults),
-            Some(f) => {
-                let v: Vec<Vault> = vaults
-                    .into_iter()
-                    .filter(|v| {
-                        v.uuid == f || v.name() == f || (f == "Private" && v.vault_type == "P")
-                    })
-                    .collect();
-                if v.is_empty() {
-                    Err(format!("no readable vault {f:?}"))
-                } else {
-                    Ok(v)
-                }
-            }
+            // Same rules as op:// references: UUID, "Private" = personal vault, unique name.
+            Some(f) => onepw::client::find_vault(&vaults, f)
+                .map(|v| vec![v.clone()])
+                .map_err(|e| e.to_string()),
         }
     }
 }
@@ -487,47 +486,85 @@ async fn run(cli: Cli) -> Result<i32, String> {
         }) => {
             let account = sign_in().await?;
             let mut cache = Cache::new(&account);
-            let mut found = None;
+            // A UUID wins; a title must be unique across the searched vaults.
+            let mut by_uuid = None;
+            let mut by_title = Vec::new();
             for v in cache.select(vault.as_deref()).await? {
-                if let Some(i) = cache
-                    .items(&v)
-                    .await?
-                    .iter()
-                    .find(|i| !i.trashed && (i.uuid == item || i.title() == item))
-                {
-                    found = Some((vault_label(&v), i.clone()));
-                    break;
+                for i in cache.items(&v).await?.iter().filter(|i| !i.trashed) {
+                    if i.uuid == item {
+                        by_uuid = Some((vault_label(&v), i.clone()));
+                    } else if i.title() == item {
+                        by_title.push((vault_label(&v), i.clone()));
+                    }
                 }
             }
-            let (vname, it) = found.ok_or_else(|| format!("no item {item:?}"))?;
-            let mask = |f: &onepw::Field| {
+            let (vname, it) = match (by_uuid, by_title.len()) {
+                (Some(hit), _) => hit,
+                (None, 1) => by_title.pop().unwrap(),
+                (None, 0) => return Err(format!("no item {item:?}")),
+                (None, n) => {
+                    let list: Vec<String> = by_title
+                        .iter()
+                        .map(|(v, i)| format!("  {}  ({v})", i.uuid))
+                        .collect();
+                    return Err(format!(
+                        "{n} items are titled {item:?}; use the UUID (or --vault):\n{}",
+                        list.join("\n")
+                    ));
+                }
+            };
+            let fields = it.fields().map_err(|e| e.to_string())?;
+            let mask = |f: &onepw::Field| -> Zeroizing<String> {
                 if f.concealed && !reveal {
-                    "••••••••".to_string()
+                    Zeroizing::new("••••••••".to_string())
                 } else {
                     f.value.clone()
                 }
             };
+            let mut out = io::stdout().lock();
+            // Grows without leaving unwiped copies behind; wiped on drop.
+            let mut text = WipingBuf::default();
             if json {
-                let fields: Vec<_> = it.fields().iter().map(|f| serde_json::json!({
-                    "section": f.section, "label": f.label, "value": mask(f), "concealed": f.concealed})).collect();
-                let out = serde_json::json!({"uuid": it.uuid, "title": it.title(), "vault": vname, "urls": it.urls(), "fields": fields});
-                println!("{}", serde_json::to_string_pretty(&out).unwrap());
-            } else {
-                println!("{}  ({vname}, {})", it.title(), it.uuid);
-                for u in it.urls() {
-                    println!("  url          {u}");
+                use serde_json::{Map, Value};
+                // Built by moving values in (json! would copy them), then wiped as a whole.
+                let mut list = Vec::with_capacity(fields.len());
+                for f in &fields {
+                    let mut m = Map::new();
+                    m.insert("section".into(), serde_json::json!(f.section));
+                    m.insert("label".into(), Value::String(f.label.clone()));
+                    m.insert("value".into(), Value::String(mask(f).to_string()));
+                    m.insert("concealed".into(), Value::Bool(f.concealed));
+                    list.push(Value::Object(m));
                 }
-                for f in it.fields() {
+                let mut m = Map::new();
+                m.insert("uuid".into(), Value::String(it.uuid.clone()));
+                m.insert("title".into(), Value::String(it.title().into()));
+                m.insert("vault".into(), Value::String(vname.clone()));
+                m.insert("urls".into(), serde_json::json!(it.urls()));
+                m.insert("fields".into(), Value::Array(list));
+                let doc = onepw::Details::new(Value::Object(m));
+                serde_json::to_writer_pretty(&mut text, &*doc).map_err(|e| e.to_string())?;
+                io::Write::write_all(&mut text, b"\n").map_err(|e| e.to_string())?;
+            } else {
+                let _ = writeln!(text, "{}  ({vname}, {})", it.title(), it.uuid);
+                for u in it.urls() {
+                    let _ = writeln!(text, "  url          {u}");
+                }
+                for f in &fields {
                     let label = match &f.section {
                         Some(s) => format!("{s} / {}", f.label),
                         None => f.label.clone(),
                     };
-                    println!("  {label:<12} {}", mask(&f));
+                    let _ = writeln!(text, "  {label:<12} {}", mask(f).as_str());
                 }
-                if !reveal && it.fields().iter().any(|f| f.concealed) {
+                if !reveal && fields.iter().any(|f| f.concealed) {
                     eprintln!("(concealed values hidden; add --reveal to show them)");
                 }
             }
+            out.write_all(text.as_bytes())
+                .and_then(|_| out.flush())
+                .map_err(|e| e.to_string())?;
+            drop(out);
             let _ = account.sign_out().await;
         }
         Cmd::Read {
@@ -564,7 +601,9 @@ async fn run(cli: Cli) -> Result<i32, String> {
                     }
                 }
             }
-            let refs: Vec<(String, String)> = std::env::vars()
+            // vars_os: a non-UTF-8 variable must not panic (the panic message would print it).
+            let refs: Vec<(String, String)> = std::env::vars_os()
+                .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
                 .chain(env.iter().cloned())
                 .filter(|(_, v)| v.starts_with("op://"))
                 .collect();
@@ -580,6 +619,15 @@ async fn run(cli: Cli) -> Result<i32, String> {
             }
             let mut child = tokio::process::Command::new(&command[0]);
             child.args(&command[1..]);
+            // Never hand onepw's own credentials (ONEPW_PASSWORD, ONEPW_SECRET_KEY, …) to the
+            // command, whether they come from the shell or an --env-file.
+            for (k, _) in std::env::vars_os() {
+                if k.to_string_lossy().starts_with("ONEPW_") {
+                    child.env_remove(&k);
+                }
+            }
+            env.retain(|(k, _)| !k.starts_with("ONEPW_"));
+            resolved.retain(|(k, _)| !k.starts_with("ONEPW_"));
             for (k, v) in &env {
                 child.env(k, v);
             }
@@ -598,11 +646,62 @@ async fn run(cli: Cli) -> Result<i32, String> {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    disable_core_dumps();
     match run(Cli::parse()).await {
         Ok(code) => ExitCode::from(code.clamp(0, 255) as u8),
         Err(e) => {
             eprintln!("onepw: {e}");
             ExitCode::from(1)
         }
+    }
+}
+
+/// A crash must not write decrypted secrets to a core file.
+#[cfg(unix)]
+fn disable_core_dumps() {
+    let none = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: setrlimit only reads the struct we pass.
+    unsafe {
+        libc::setrlimit(libc::RLIMIT_CORE, &none);
+    }
+}
+
+#[cfg(not(unix))]
+fn disable_core_dumps() {}
+
+/// An output buffer that wipes itself: on drop, and whenever it grows (the old allocation is
+/// zeroed before it's freed), so revealed values don't linger in freed memory.
+#[derive(Default)]
+struct WipingBuf(Zeroizing<Vec<u8>>);
+
+impl WipingBuf {
+    fn reserve(&mut self, extra: usize) {
+        let need = self.0.len() + extra;
+        if need > self.0.capacity() {
+            let mut bigger = Zeroizing::new(Vec::with_capacity(
+                need.max(2 * self.0.capacity()).max(1024),
+            ));
+            bigger.extend_from_slice(&self.0);
+            self.0 = bigger; // the old buffer is wiped as it drops
+        }
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl io::Write for WipingBuf {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.reserve(buf.len());
+        self.0.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }

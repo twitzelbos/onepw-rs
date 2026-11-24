@@ -11,7 +11,7 @@
 //!
 //! `host` is lowercase and without the port; `?` is always present. The body is not covered.
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 
 use crate::b64;
@@ -26,7 +26,8 @@ pub fn request_mac(
     method: &str,
     url: &reqwest::Url,
 ) -> String {
-    let mut derive = <Hmac<Sha256> as Mac>::new_from_slice(session_key).expect("any key length");
+    let mut derive =
+        <Hmac<Sha256> as KeyInit>::new_from_slice(session_key).expect("any key length");
     derive.update(DERIVATION_MESSAGE);
     let mac_key = derive.finalize().into_bytes();
 
@@ -38,7 +39,7 @@ pub fn request_mac(
         method.to_ascii_uppercase()
     );
 
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&mac_key).expect("any key length");
+    let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(&mac_key).expect("any key length");
     mac.update(message.as_bytes());
     let tag = mac.finalize().into_bytes();
     format!("v1|{request_id}|{}", b64::encode(&tag[..12]))

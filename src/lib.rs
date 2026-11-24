@@ -1,6 +1,6 @@
 #![doc = include_str!("../README.md")]
 #![cfg_attr(docsrs, feature(doc_cfg))]
-#![deny(unsafe_code)] // the only exception is the macOS Touch ID FFI in `touchid`
+#![deny(unsafe_code)] // exceptions: `locked` (mlock) and `touchid` (macOS FFI)
 #![warn(missing_docs)]
 
 pub(crate) mod b64;
@@ -8,6 +8,7 @@ pub mod client;
 pub mod error;
 pub mod kdf;
 pub mod keys;
+mod locked;
 pub mod mac;
 pub mod secret_key;
 pub mod srp;
@@ -17,8 +18,8 @@ pub mod srp;
 pub mod touchid;
 
 pub use client::{
-    Account, ClientIdentity, Credentials, Field, Item, SecretReference, SignInOptions, UnlockKeys,
-    Vault,
+    Account, ClientIdentity, Credentials, Details, Field, Item, SecretReference, SignInOptions,
+    UnlockKeys, Vault,
 };
 pub use secret_key::SecretKey;
 

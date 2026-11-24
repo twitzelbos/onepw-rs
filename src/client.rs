@@ -13,17 +13,19 @@
 //! `GET v1/account?attrs=vaults` (vaults and their RSA-wrapped vault keys) and
 //! `GET v1/vault/{uuid}/{batch}/items` (items, AES-GCM under the vault key).
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use rand::Rng;
+use rand::RngExt;
 use reqwest::{Method, Url};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::error::{Error, Result};
 use crate::keys::{EncryptedKeyset, EncryptedObject, Keyset, SymmetricKey, decrypt_keysets};
+use crate::locked::Locked;
 use crate::secret_key::SecretKey;
 use crate::{b64, kdf, mac, srp};
 
@@ -101,9 +103,140 @@ pub struct SignInOptions {
     /// Called when the account has authenticator-app 2FA enabled; returns the 6-digit code.
     #[allow(clippy::type_complexity)]
     pub totp: Option<Box<dyn Fn() -> Result<String> + Send + Sync>>,
-    /// Base URL override (for tests). Defaults to `https://{sign_in_address}/api/`.
+    /// Base URL override (for tests). Defaults to `https://{sign_in_address}/api/`. An explicit
+    /// base URL is used as given: the 1Password-domain check below doesn't apply to it.
     pub base_url: Option<Url>,
+    /// Allow sign-in addresses outside 1Password's own domains (default `false`). In 1Password's
+    /// protocol the client sends its SRP proof first, so a mistyped or look-alike address would
+    /// hand that proof to a stranger. Only `*.1password.com`, `*.1password.ca` and
+    /// `*.1password.eu` are accepted unless this is set.
+    pub allow_any_host: bool,
+    /// Timeout for each HTTP request (default 120 s; connecting has its own 15 s limit).
+    pub timeout: std::time::Duration,
+    /// Refuse to sign in if the server asks for fewer PBKDF2 iterations than this (default
+    /// [`MIN_KDF_ITERATIONS`]). The count comes from the server; a forged low count would make
+    /// offline guessing of the password cheap.
+    pub min_kdf_iterations: u32,
 }
+
+/// What a response must look like.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reply {
+    /// Before the session key exists (or for discarded replies): plain JSON.
+    Plain,
+    /// After sign-in: an envelope encrypted with the session key.
+    Encrypted,
+    /// After sign-in, for calls whose reply is discarded (2FA): anything but an error is fine.
+    /// Accepting a forged "success" here is harmless: the real server still refuses the session
+    /// if 2FA didn't actually pass, and no data from this reply is used.
+    Discarded,
+}
+
+/// Interprets a successful (2xx) response body. In an encrypted session the body must be an
+/// envelope under the session key (checked by key ID and GCM tag). A plaintext object carrying
+/// `errorCode` is always turned into an error, never returned as data, and any other plaintext
+/// (including an empty body where data is expected) is refused.
+fn decode_response(
+    path: &str,
+    text: &str,
+    reply: Reply,
+    session_key: Option<&SymmetricKey>,
+) -> Result<Value> {
+    let value: Value = if text.trim().is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_str(text)?
+    };
+    let as_error = |v: &Value| -> Option<Error> {
+        let code = v.get("errorCode")?;
+        Some(Error::Server {
+            status: code
+                .as_i64()
+                .map_or(0, |c| c.clamp(0, u16::MAX.into()) as u16),
+            body: truncate(v.get("errorMessage").and_then(Value::as_str).unwrap_or("")),
+        })
+    };
+    let refuse = || {
+        // After SRP, the real server encrypts every response with the session key. Plaintext can
+        // only come from someone between us and the server (e.g. a TLS-intercepting proxy), who
+        // could otherwise inject or hide vaults and items.
+        Error::Protocol(format!(
+            "{path}: the server's response was not encrypted with the session key; refusing it \
+             (the connection may be intercepted)"
+        ))
+    };
+    let key = match (reply, session_key) {
+        (Reply::Plain, _) | (_, None) => {
+            return match as_error(&value) {
+                Some(e) => Err(e),
+                None => Ok(value),
+            };
+        }
+        (_, Some(key)) => key,
+    };
+    if value.get("enc").is_some() && value.get("data").is_some() {
+        let env: EncryptedObject = serde_json::from_value(value)?;
+        let inner: Value = env.decrypt_json(key)?;
+        return match as_error(&inner) {
+            Some(e) => Err(e),
+            None if reply == Reply::Discarded => Ok(Value::Null),
+            None => Ok(inner),
+        };
+    }
+    if let Some(code) = value.get("errorCode") {
+        // A plaintext error in an encrypted session: still only an error, but say it was
+        // unencrypted, so injected errors don't pass for ordinary server errors.
+        return Err(Error::Protocol(format!(
+            "{path}: unencrypted error response (errorCode {code}, message {:?}); the connection \
+             may be intercepted",
+            truncate(
+                value
+                    .get("errorMessage")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+            )
+        )));
+    }
+    if reply == Reply::Discarded {
+        return Ok(Value::Null);
+    }
+    Err(refuse())
+}
+
+/// 1Password's sign-in domains. A sign-in address must be one of these or a subdomain.
+pub const ONEPASSWORD_DOMAINS: &[&str] = &["1password.com", "1password.ca", "1password.eu"];
+
+/// Most pages of items onepw fetches for one vault (each page holds many items).
+const MAX_ITEM_PAGES: u32 = 10_000;
+
+/// Most encrypted item data onepw keeps in memory for one vault (256 MiB).
+const MAX_VAULT_BYTES: usize = 256 << 20;
+
+/// Largest server response onepw accepts (64 MiB); bigger ones are refused, not buffered.
+const MAX_RESPONSE_BYTES: usize = 64 << 20;
+
+/// Checks that `url` is HTTPS on one of [`ONEPASSWORD_DOMAINS`].
+fn check_onepassword_host(url: &Url) -> Result<()> {
+    let host = url.host_str().unwrap_or("").to_ascii_lowercase();
+    let ok = url.scheme() == "https"
+        && url.username().is_empty()
+        && url.password().is_none()
+        && ONEPASSWORD_DOMAINS
+            .iter()
+            .any(|d| host == *d || host.ends_with(&format!(".{d}")));
+    if ok {
+        Ok(())
+    } else {
+        Err(Error::InvalidInput(format!(
+            "sign-in address {host:?} is not a 1Password domain ({}); refusing to send it your \
+             sign-in proof (set SignInOptions::allow_any_host to override)",
+            ONEPASSWORD_DOMAINS.join(", ")
+        )))
+    }
+}
+
+/// Default minimum PBKDF2 iteration count. Current accounts use 650 000; very old ones 100 000.
+pub const MIN_KDF_ITERATIONS: u32 = 100_000;
 
 impl SignInOptions {
     /// Options with a fresh device UUID and default identity.
@@ -113,6 +246,9 @@ impl SignInOptions {
             identity: ClientIdentity::default(),
             totp: None,
             base_url: None,
+            allow_any_host: false,
+            timeout: std::time::Duration::from_secs(120),
+            min_kdf_iterations: MIN_KDF_ITERATIONS,
         }
     }
 }
@@ -123,12 +259,22 @@ impl Default for SignInOptions {
     }
 }
 
+fn check_iterations(n: u32, min: u32) -> Result<u32> {
+    if n < min {
+        return Err(Error::Protocol(format!(
+            "the server asked for only {n} key-derivation iterations (minimum {min}); \
+             refusing to sign in (possible tampering)"
+        )));
+    }
+    Ok(n)
+}
+
 /// A random device UUID in 1Password's format (26 characters of `a-z2-7`).
 pub fn new_device_uuid() -> String {
     const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz234567";
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     (0..26)
-        .map(|_| ALPHABET[rng.gen_range(0..32)] as char)
+        .map(|_| ALPHABET[rng.random_range(0..32)] as char)
         .collect()
 }
 
@@ -158,8 +304,8 @@ impl std::fmt::Debug for Account {
 /// apps avoid keeping your password.
 #[derive(Clone)]
 pub struct UnlockKeys {
-    srp_x: Zeroizing<[u8; 32]>,
-    auk: Zeroizing<[u8; 32]>,
+    srp_x: Locked<32>,
+    auk: Locked<32>,
 }
 
 impl UnlockKeys {
@@ -179,8 +325,8 @@ impl UnlockKeys {
                 bytes.len()
             )));
         }
-        let mut srp_x = Zeroizing::new([0u8; 32]);
-        let mut auk = Zeroizing::new([0u8; 32]);
+        let mut srp_x = Locked::zeroed();
+        let mut auk = Locked::zeroed();
         srp_x.copy_from_slice(&bytes[..32]);
         auk.copy_from_slice(&bytes[32..]);
         Ok(UnlockKeys { srp_x, auk })
@@ -210,7 +356,7 @@ pub struct Vault {
     pub attrs: Value,
     /// Number of active items, as reported by the server.
     pub active_item_count: Option<u64>,
-    key: SymmetricKey,
+    key: Arc<SymmetricKey>,
 }
 
 impl Vault {
@@ -220,8 +366,14 @@ impl Vault {
     }
 }
 
-/// A decrypted item.
-#[derive(Clone, Debug)]
+/// A downloaded item. The overview (title, URLs, tags) is decrypted; the details (fields,
+/// passwords, notes) stay **encrypted** until you ask for them with [`Item::details`],
+/// [`Item::fields`] or [`Item::field`], so listing a vault doesn't put every secret in memory.
+/// `Debug` shows only the UUID and title.
+///
+/// **Not protected:** copies you make of decrypted values (`.to_string()`, `.clone()` into a
+/// plain `String`, `format!`). See the README's *What onepw does NOT protect*.
+#[derive(Clone)]
 pub struct Item {
     /// Item UUID.
     pub uuid: String,
@@ -231,29 +383,139 @@ pub struct Item {
     pub trashed: bool,
     /// Decrypted overview: `title`, `url`, `URLs`, `tags`, …
     pub overview: Value,
-    /// Decrypted details: `fields`, `sections`, `notesPlain`, `password`, …
-    /// Zeroing a `serde_json::Value` isn't possible; drop items as soon as you're done.
-    pub details: Value,
+    enc_details: Option<EncryptedObject>,
+    key: Arc<SymmetricKey>,
 }
 
+impl std::fmt::Debug for Item {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Item")
+            .field("uuid", &self.uuid)
+            .field("title", &self.title())
+            .field("template_uuid", &self.template_uuid)
+            .field("trashed", &self.trashed)
+            .field("details", &"<encrypted>")
+            .finish()
+    }
+}
+
+/// Decrypted item details (`fields`, `sections`, `notesPlain`, `password`, …) as JSON.
+///
+/// Derefs to [`serde_json::Value`]. On drop, every string in it is overwritten with zeros;
+/// `Debug` prints `Details(<redacted>)`.
+///
+/// # Not protected
+///
+/// * Copies you make (`.to_string()`, `.clone()`, `serde_json::to_string(&*details)`, values
+///   taken out with `as_str().to_owned()`) are ordinary heap memory and are **not** wiped.
+/// * Object keys (field names such as `"password"`) and numbers are not wiped; only string values.
+/// * While decrypting, `serde_json` copies strings that contain escape characters through an
+///   internal buffer that is freed without being wiped.
+pub struct Details(Value);
+
+impl Details {
+    /// Wraps any JSON value so its strings are wiped on drop.
+    pub fn new(value: Value) -> Self {
+        Details(value)
+    }
+}
+
+impl std::ops::Deref for Details {
+    type Target = Value;
+    fn deref(&self) -> &Value {
+        &self.0
+    }
+}
+
+impl Drop for Details {
+    fn drop(&mut self) {
+        wipe_json(&mut self.0);
+    }
+}
+
+impl std::fmt::Debug for Details {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Details(<redacted>)")
+    }
+}
+
+/// Overwrites every string value (not object keys, which are field names) with zeros.
+fn wipe_json(v: &mut Value) {
+    match v {
+        Value::String(s) => s.zeroize(),
+        Value::Array(a) => a.iter_mut().for_each(wipe_json),
+        Value::Object(m) => m.values_mut().for_each(wipe_json),
+        _ => {}
+    }
+}
+
+/// Top-level field types (`fields[].type`) whose values aren't secret: text, email, URL, checkbox,
+/// phone, number. Anything else (including `P` passwords and types onepw doesn't know) counts
+/// as concealed, so a new kind of secret is hidden by default rather than printed.
+const PLAIN_TOP_LEVEL_TYPES: &[&str] = &["T", "E", "U", "C", "N", "TEL"];
+
+/// Section field kinds (`sections[].fields[].k`) whose values aren't secret. Anything else
+/// (`concealed`, `sshKey`, unknown kinds) counts as concealed.
+const PLAIN_SECTION_KINDS: &[&str] = &[
+    "string",
+    "email",
+    "URL",
+    "date",
+    "monthYear",
+    "phone",
+    "address",
+    "menu",
+    "cctype",
+    "gender",
+    "reference",
+];
+
 /// One field of an item, flattened from the top-level `fields` and the `sections`.
-#[derive(Clone, Debug)]
+/// The value is wiped on drop; `Debug` shows it as `<redacted>`. Cloning the `Field` gives
+/// another wiped copy; `field.value.to_string()` gives an unprotected one.
+#[derive(Clone)]
 pub struct Field {
     /// Section title, if the field is in a section.
     pub section: Option<String>,
     /// Field label (`"username"`, `"password"`, `"credential"`, a custom label, …).
     pub label: String,
     /// The value.
-    pub value: String,
+    pub value: Zeroizing<String>,
     /// Whether 1Password treats it as secret (password / concealed fields).
     pub concealed: bool,
 }
 
+impl std::fmt::Debug for Field {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Field")
+            .field("section", &self.section)
+            .field("label", &self.label)
+            .field("value", &"<redacted>")
+            .field("concealed", &self.concealed)
+            .finish()
+    }
+}
+
 impl Item {
+    /// Decrypts the details. Each call decrypts again; the result is wiped when dropped.
+    pub fn details(&self) -> Result<Details> {
+        Ok(Details(match &self.enc_details {
+            Some(d) => d.decrypt_json(&self.key)?,
+            None => Value::Null,
+        }))
+    }
+
     /// All fields with a non-empty value, top-level fields first, then section fields.
-    pub fn fields(&self) -> Vec<Field> {
-        let d = &self.details;
+    pub fn fields(&self) -> Result<Vec<Field>> {
+        let d = self.details()?;
         let s = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+        let secret = |v: Option<&Value>| -> Zeroizing<String> {
+            Zeroizing::new(match v {
+                Some(Value::String(x)) => x.clone(),
+                Some(Value::Null) | None => String::new(),
+                Some(other) => other.to_string(),
+            })
+        };
         let mut out = Vec::new();
         for f in d
             .get("fields")
@@ -266,20 +528,22 @@ impl Item {
                 .unwrap_or_else(|| s(f, "name"));
             out.push(Field {
                 section: None,
-                concealed: s(f, "type") == "P" || label == "password",
+                concealed: label == "password"
+                    || (label != "username"
+                        && !PLAIN_TOP_LEVEL_TYPES.contains(&s(f, "type").as_str())),
                 label,
-                value: s(f, "value"),
+                value: secret(f.get("value")),
             });
         }
-        if let Some(p) = d.get("password").and_then(Value::as_str) {
-            if !out.iter().any(|f| f.label == "password") {
-                out.push(Field {
-                    section: None,
-                    label: "password".into(),
-                    value: p.into(),
-                    concealed: true,
-                });
-            }
+        if let Some(p) = d.get("password").filter(|p| p.is_string())
+            && !out.iter().any(|f| f.label == "password")
+        {
+            out.push(Field {
+                section: None,
+                label: "password".into(),
+                value: secret(Some(p)),
+                concealed: true,
+            });
         }
         for sec in d
             .get("sections")
@@ -299,21 +563,14 @@ impl Item {
                     .unwrap_or_else(|| s(f, "n"));
                 out.push(Field {
                     section: title.clone(),
-                    concealed: s(f, "k") == "concealed",
+                    concealed: !PLAIN_SECTION_KINDS.contains(&s(f, "k").as_str()),
                     label,
-                    value: f
-                        .get("v")
-                        .map(|v| {
-                            v.as_str()
-                                .map(str::to_owned)
-                                .unwrap_or_else(|| v.to_string())
-                        })
-                        .unwrap_or_default(),
+                    value: secret(f.get("v")),
                 });
             }
         }
         out.retain(|f| !f.value.is_empty());
-        out
+        Ok(out)
     }
 
     /// The item's URLs (from the overview).
@@ -326,10 +583,10 @@ impl Item {
             .flatten()
             .filter_map(|u| u.get("u").and_then(Value::as_str))
             .collect();
-        if v.is_empty() {
-            if let Some(u) = self.overview.get("url").and_then(Value::as_str) {
-                v.push(u);
-            }
+        if v.is_empty()
+            && let Some(u) = self.overview.get("url").and_then(Value::as_str)
+        {
+            v.push(u);
         }
         v
     }
@@ -344,35 +601,42 @@ impl Item {
 
     /// Finds a field value by its name, label or designation (`"username"`, `"password"`,
     /// `"credential"`, a section field label, …). Looks at top-level fields, the legacy
-    /// `password` key, and section fields.
+    /// `password` key, and section fields. Decrypts the details for this call only.
     ///
     /// ```no_run
     /// # async fn run(account: &onepw::Account) -> onepw::Result<()> {
     /// for vault in account.vaults().await? {
     ///     for item in account.items(&vault).await? {
-    ///         if let (false, Some(user)) = (item.trashed, item.field("username")) {
-    ///             println!("{}: {}", item.title(), user);
+    ///         if item.trashed {
+    ///             continue;
+    ///         }
+    ///         if let Some(user) = item.field("username")? {
+    ///             println!("{}: {}", item.title(), *user);
     ///         }
     ///     }
     /// }
     /// # Ok(()) }
     /// ```
-    pub fn field(&self, name: &str) -> Option<&str> {
-        let d = &self.details;
+    pub fn field(&self, name: &str) -> Result<Option<Zeroizing<String>>> {
+        let d = self.details()?;
+        let own = |v: Option<&Value>| {
+            v.and_then(Value::as_str)
+                .map(|s| Zeroizing::new(s.to_owned()))
+        };
         if let Some(fields) = d.get("fields").and_then(Value::as_array) {
             for f in fields {
                 let hit = ["designation", "name"]
                     .iter()
                     .any(|k| f.get(*k).and_then(Value::as_str) == Some(name));
                 if hit {
-                    return f.get("value").and_then(Value::as_str);
+                    return Ok(own(f.get("value")));
                 }
             }
         }
-        if name == "password" {
-            if let Some(p) = d.get("password").and_then(Value::as_str) {
-                return Some(p);
-            }
+        if name == "password"
+            && let Some(p) = own(d.get("password"))
+        {
+            return Ok(Some(p));
         }
         for s in d
             .get("sections")
@@ -390,11 +654,11 @@ impl Item {
                     .iter()
                     .any(|k| f.get(*k).and_then(Value::as_str) == Some(name));
                 if hit {
-                    return f.get("v").and_then(Value::as_str);
+                    return Ok(own(f.get("v")));
                 }
             }
         }
-        None
+        Ok(None)
     }
 }
 
@@ -473,7 +737,17 @@ impl Account {
             None => Url::parse(&format!("https://{}/api/", creds.1.trim_end_matches('/')))
                 .map_err(|e| Error::InvalidInput(format!("sign-in address: {e}")))?,
         };
-        let http = reqwest::Client::builder().build()?;
+        if opts.base_url.is_none() && !opts.allow_any_host {
+            check_onepassword_host(&base)?;
+        }
+        let http = reqwest::Client::builder()
+            // 1Password's API never redirects; following one could send the session's requests
+            // (session ID, MAC, encrypted bodies) to another host.
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(std::time::Duration::from_secs(15))
+            .timeout(opts.timeout)
+            .https_only(opts.base_url.is_none())
+            .build()?;
         let mut rest = Rest::new(http, base, &opts.identity, &opts.device_uuid);
 
         // 1. Start the session (registering the device if needed).
@@ -487,12 +761,14 @@ impl Account {
         }
         rest.session_id = Some(start.session_id.clone());
         let auth = start.user_auth;
+        check_iterations(auth.iterations, opts.min_kdf_iterations)?;
 
         // 2. SRP: A → B.
         let salt = b64::decode(&auth.salt)?;
         let x = match secret {
             Secret::Password(pw) => {
-                kdf::srp_x(pw, sk, creds.0, &auth.method, &salt, auth.iterations)?
+                let mut x = kdf::srp_x(pw, sk, creds.0, &auth.method, &salt, auth.iterations)?;
+                Locked::take(&mut x)
             }
             Secret::Keys(k) => k.srp_x.clone(),
         };
@@ -536,7 +812,7 @@ impl Account {
 
         // 4. Encrypted + MAC'd from here on.
         rest.session_key = Some(SymmetricKey::new(start.session_id.clone(), *key.as_bytes()));
-        rest.request_id = AtomicU32::new(rand::thread_rng().gen_range(1..u32::MAX / 2));
+        rest.request_id = AtomicU32::new(rand::rng().random_range(1..u32::MAX / 2));
         let complete: Value = rest
             .post(
                 "v2/auth/complete",
@@ -571,8 +847,11 @@ impl Account {
                         .as_deref()
                         .ok_or_else(|| Error::Malformed("encSymKey without p2s".into()))?,
                 )?,
-                esk.p2c
-                    .ok_or_else(|| Error::Malformed("encSymKey without p2c".into()))?,
+                check_iterations(
+                    esk.p2c
+                        .ok_or_else(|| Error::Malformed("encSymKey without p2c".into()))?,
+                    opts.min_kdf_iterations,
+                )?,
             )?,
             Secret::Keys(k) => SymmetricKey::new("mp", *k.auk),
         };
@@ -582,7 +861,7 @@ impl Account {
         };
         let unlock_keys = UnlockKeys {
             srp_x: x,
-            auk: Zeroizing::new(*auk.as_bytes()),
+            auk: auk.as_bytes_locked(),
         };
         Ok(Account {
             rest,
@@ -620,7 +899,7 @@ impl Account {
                 vault_type: raw.vault_type,
                 attrs,
                 active_item_count: raw.active_item_count,
-                key,
+                key: Arc::new(key),
             });
         }
         Ok(out)
@@ -634,10 +913,10 @@ impl Account {
             let Some(ks) = self.keysets.iter().find(|k| k.uuid == a.enc_vault_key.kid) else {
                 continue;
             };
-            if let Ok(jwk) = ks.private.decrypt_object_jwk(&a.enc_vault_key) {
-                if let Ok(k) = SymmetricKey::from_jwk(&jwk) {
-                    return Some(k);
-                }
+            if let Ok(jwk) = ks.private.decrypt_object_jwk(&a.enc_vault_key)
+                && let Ok(k) = SymmetricKey::from_jwk(&jwk)
+            {
+                return Some(k);
             }
         }
         None
@@ -648,18 +927,37 @@ impl Account {
     pub async fn items(&self, vault: &Vault) -> Result<Vec<Item>> {
         let mut out = Vec::new();
         let mut batch: u64 = 0;
+        let mut pages = 0u32;
+        let mut total = 0usize; // encrypted bytes kept in memory for this vault
         loop {
             let resp: ItemsBatch = self
                 .rest
                 .get(&format!("v1/vault/{}/{batch}/items", vault.uuid))
                 .await?;
             for it in resp.items {
+                total += it.enc_overview.data.len()
+                    + it.enc_details.as_ref().map_or(0, |d| d.data.len());
+                if total > MAX_VAULT_BYTES {
+                    return Err(Error::Protocol(format!(
+                        "vault {}: more than {} MiB of item data; giving up",
+                        vault.uuid,
+                        MAX_VAULT_BYTES >> 20
+                    )));
+                }
                 out.push(Item {
                     overview: it.enc_overview.decrypt_json(&vault.key)?,
-                    details: match &it.enc_details {
-                        Some(d) => d.decrypt_json(&vault.key)?,
-                        None => Value::Null,
+                    enc_details: match it.enc_details {
+                        // Decrypted on demand; check the key now so errors show up here.
+                        Some(d) if d.kid != vault.key.kid() => {
+                            return Err(Error::Decrypt(format!(
+                                "item details encrypted with key {:?}, not {:?}",
+                                d.kid,
+                                vault.key.kid()
+                            )));
+                        }
+                        d => d,
                     },
+                    key: vault.key.clone(),
                     uuid: it.uuid,
                     template_uuid: it.template_uuid.unwrap_or_default(),
                     trashed: it.trashed.as_deref() == Some("Y"),
@@ -669,6 +967,14 @@ impl Account {
                 return Ok(out);
             }
             batch = resp.content_version.unwrap_or(0);
+            pages += 1;
+            // A server that never says "complete" must not keep us paging forever.
+            if pages >= MAX_ITEM_PAGES {
+                return Err(Error::Protocol(format!(
+                    "vault {}: more than {MAX_ITEM_PAGES} pages of items; giving up",
+                    vault.uuid
+                )));
+            }
         }
     }
 
@@ -679,6 +985,7 @@ impl Account {
     /// # async fn run(account: &onepw::Account) -> onepw::Result<()> {
     /// let key = account.read("op://Private/Anthropic API/credential").await?;
     /// // `key` is a Zeroizing<String>: wiped from memory when dropped.
+    /// // Use it by reference (`&*key`); `key.to_string()` would make an unwiped copy.
     /// # Ok(()) }
     /// ```
     pub async fn read(&self, reference: &str) -> Result<Zeroizing<String>> {
@@ -693,7 +1000,7 @@ impl Account {
     pub async fn sign_out(self) -> Result<()> {
         let _: Value = self
             .rest
-            .request(Method::PUT, "v1/session/signout", None)
+            .send(Method::PUT, "v1/session/signout", None, Reply::Plain) // response is discarded
             .await
             .or_else(|e| match e {
                 Error::Malformed(_) => Ok(Value::Null), // empty body
@@ -763,8 +1070,7 @@ async fn second_factor(
             Error::Unsupported("this account needs a 2FA code: set SignInOptions::totp".into())
         })?;
         let code = ask()?;
-        let _: Value = rest
-            .post(
+        rest.post_discarding_reply(
                 "v1/auth/mfa",
                 &json!({"sessionID": session_id, "client": opts.identity.client_id(), "totp": {"code": code.trim()}}),
             )
@@ -826,24 +1132,39 @@ impl Rest {
 
     /// Unencrypted JSON POST (before the session key is confirmed).
     async fn post_plain<T: DeserializeOwned>(&self, path: &str, body: &Value) -> Result<T> {
-        self.send(Method::POST, path, Some(body.clone()), false)
+        self.send(Method::POST, path, Some(body.clone()), Reply::Plain)
             .await
     }
 
     /// Encrypted JSON POST.
     async fn post<T: DeserializeOwned>(&self, path: &str, body: &Value) -> Result<T> {
+        self.post_expecting(path, body, Reply::Encrypted).await
+    }
+
+    /// Encrypted POST whose reply is discarded: an empty body is accepted too.
+    async fn post_discarding_reply(&self, path: &str, body: &Value) -> Result<()> {
+        let _: Value = self.post_expecting(path, body, Reply::Discarded).await?;
+        Ok(())
+    }
+
+    async fn post_expecting<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &Value,
+        reply: Reply,
+    ) -> Result<T> {
         let key = self
             .session_key
             .as_ref()
             .ok_or_else(|| Error::Protocol("not signed in".into()))?;
         let env = EncryptedObject::encrypt(key, "b5+jwk+json", &serde_json::to_vec(body)?);
-        self.send(Method::POST, path, Some(serde_json::to_value(env)?), true)
+        self.send(Method::POST, path, Some(serde_json::to_value(env)?), reply)
             .await
     }
 
     /// Encrypted GET.
     async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T> {
-        self.send(Method::GET, path, None, true).await
+        self.send(Method::GET, path, None, Reply::Encrypted).await
     }
 
     async fn request<T: DeserializeOwned>(
@@ -852,8 +1173,12 @@ impl Rest {
         path: &str,
         body: Option<Value>,
     ) -> Result<T> {
-        let encrypted = self.session_key.is_some();
-        self.send(method, path, body, encrypted).await
+        let reply = if self.session_key.is_some() {
+            Reply::Encrypted
+        } else {
+            Reply::Plain
+        };
+        self.send(method, path, body, reply).await
     }
 
     async fn send<T: DeserializeOwned>(
@@ -861,7 +1186,7 @@ impl Rest {
         method: Method,
         path: &str,
         body: Option<Value>,
-        encrypted: bool,
+        reply: Reply,
     ) -> Result<T> {
         let url = self
             .base
@@ -884,38 +1209,29 @@ impl Rest {
         if let Some(b) = body {
             req = req.json(&b);
         }
-        let resp = req.send().await?;
+        let mut resp = req.send().await?;
         let status = resp.status();
-        let text = resp.text().await?;
+        if resp
+            .content_length()
+            .is_some_and(|n| n > MAX_RESPONSE_BYTES as u64)
+        {
+            return Err(Error::Protocol(format!("{path}: response too large")));
+        }
+        let mut body = Zeroizing::new(Vec::new());
+        while let Some(chunk) = resp.chunk().await? {
+            if body.len() + chunk.len() > MAX_RESPONSE_BYTES {
+                return Err(Error::Protocol(format!("{path}: response too large")));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let text = String::from_utf8_lossy(&body);
         if !status.is_success() {
             return Err(Error::Server {
                 status: status.as_u16(),
                 body: truncate(&text),
             });
         }
-        let value: Value = if text.trim().is_empty() {
-            Value::Null
-        } else {
-            serde_json::from_str(&text)?
-        };
-        let value = match (encrypted, &self.session_key) {
-            (true, Some(key)) if value.get("enc").is_some() && value.get("data").is_some() => {
-                let env: EncryptedObject = serde_json::from_value(value)?;
-                env.decrypt_json(key)?
-            }
-            _ => value,
-        };
-        if let Some(code) = value.get("errorCode").and_then(Value::as_i64) {
-            let msg = value
-                .get("errorMessage")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            return Err(Error::Server {
-                status: code as u16,
-                body: msg,
-            });
-        }
+        let value = decode_response(path, &text, reply, self.session_key.as_ref())?;
         Ok(serde_json::from_value(value)?)
     }
 }
@@ -993,6 +1309,40 @@ struct RawItem {
     enc_details: Option<EncryptedObject>,
 }
 
+/// Finds a vault by UUID or name. `"Private"` always means your personal vault (type `P`) and
+/// never matches by name, so a vault someone shares with you named "Private" can't take its
+/// place. Any other name must be unique: two readable vaults with the same name are an error.
+pub fn find_vault<'a>(vaults: &'a [Vault], name_or_uuid: &str) -> Result<&'a Vault> {
+    if let Some(v) = vaults.iter().find(|v| v.uuid == name_or_uuid) {
+        return Ok(v);
+    }
+    if name_or_uuid == "Private" {
+        return vaults.iter().find(|v| v.vault_type == "P").ok_or_else(|| {
+            Error::InvalidInput(
+                "your personal vault isn't readable (use the vault UUID for a vault named \
+                 \"Private\")"
+                    .into(),
+            )
+        });
+    }
+    let named: Vec<&Vault> = vaults.iter().filter(|v| v.name() == name_or_uuid).collect();
+    match named.as_slice() {
+        [v] => Ok(v),
+        [] => Err(Error::InvalidInput(format!(
+            "no readable vault {name_or_uuid:?}"
+        ))),
+        many => Err(Error::InvalidInput(format!(
+            "{} vaults are named {:?} ({}); use the vault UUID",
+            many.len(),
+            name_or_uuid,
+            many.iter()
+                .map(|v| v.uuid.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
+    }
+}
+
 /// A parsed secret reference `op://<vault>/<item>/<field>`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SecretReference {
@@ -1029,35 +1379,349 @@ impl SecretReference {
         }
     }
 
-    /// Picks the vault this reference points to.
+    /// Picks the vault this reference points to (see [`find_vault`]).
     pub fn find_vault<'a>(&self, vaults: &'a [Vault]) -> Result<&'a Vault> {
-        vaults
-            .iter()
-            .find(|v| v.uuid == self.vault || v.name() == self.vault)
-            .or_else(|| {
-                (self.vault == "Private")
-                    .then(|| vaults.iter().find(|v| v.vault_type == "P"))
-                    .flatten()
-            })
-            .ok_or_else(|| Error::InvalidInput(format!("no readable vault {:?}", self.vault)))
+        find_vault(vaults, &self.vault)
     }
 
-    /// Resolves the reference among a vault's items (trashed items are ignored).
+    /// Resolves the reference among a vault's items (trashed items are ignored). By UUID, or by
+    /// title, which must be unique in the vault.
     pub fn resolve_in(&self, items: &[Item]) -> Result<Zeroizing<String>> {
-        let item = items
-            .iter()
-            .filter(|i| !i.trashed)
-            .find(|i| i.uuid == self.item || i.title() == self.item)
-            .ok_or_else(|| {
-                Error::InvalidInput(format!("no item {:?} in vault {:?}", self.item, self.vault))
-            })?;
-        item.field(&self.field)
-            .map(|v| Zeroizing::new(v.to_string()))
-            .ok_or_else(|| {
-                Error::InvalidInput(format!(
-                    "item {:?} has no field {:?}",
-                    self.item, self.field
-                ))
-            })
+        let live = || items.iter().filter(|i| !i.trashed);
+        let item = match live().find(|i| i.uuid == self.item) {
+            Some(i) => i,
+            None => {
+                let titled: Vec<&Item> = live().filter(|i| i.title() == self.item).collect();
+                match titled.as_slice() {
+                    [i] => *i,
+                    [] => {
+                        return Err(Error::InvalidInput(format!(
+                            "no item {:?} in vault {:?}",
+                            self.item, self.vault
+                        )));
+                    }
+                    many => {
+                        return Err(Error::InvalidInput(format!(
+                            "{} items are titled {:?} in vault {:?} ({}); use the item UUID in \
+                             the reference",
+                            many.len(),
+                            self.item,
+                            self.vault,
+                            many.iter()
+                                .map(|i| i.uuid.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )));
+                    }
+                }
+            }
+        };
+        item.field(&self.field)?.ok_or_else(|| {
+            Error::InvalidInput(format!(
+                "item {:?} has no field {:?}",
+                self.item, self.field
+            ))
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn vault(uuid: &str, name: &str, vault_type: &str) -> Vault {
+        Vault {
+            uuid: uuid.into(),
+            vault_type: vault_type.into(),
+            attrs: json!({"name": name}),
+            active_item_count: None,
+            key: Arc::new(SymmetricKey::new(uuid, [7; 32])),
+        }
+    }
+
+    fn item(uuid: &str, title: &str, key: &Arc<SymmetricKey>, password: &str) -> Item {
+        let details = json!({"fields": [{"designation": "password", "value": password}]});
+        Item {
+            uuid: uuid.into(),
+            template_uuid: "001".into(),
+            trashed: false,
+            overview: json!({"title": title}),
+            enc_details: Some(EncryptedObject::encrypt(
+                key,
+                "b5+json",
+                details.to_string().as_bytes(),
+            )),
+            key: key.clone(),
+        }
+    }
+
+    #[test]
+    fn ambiguous_vault_names_are_refused() {
+        let vaults = [
+            vault("p1", "Private", "P"),
+            vault("u1", "Work", "U"),
+            vault("u2", "Work", "U"),
+            vault("u3", "Private", "U"),
+        ];
+        let r = |s: &str| SecretReference::parse(s).unwrap();
+        // "Private" is the personal vault even when someone shares a vault named "Private".
+        assert_eq!(
+            r("op://Private/x/y").find_vault(&vaults).unwrap().uuid,
+            "p1"
+        );
+        let err = r("op://Work/x/y")
+            .find_vault(&vaults)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("2 vaults") && err.contains("u1") && err.contains("u2"),
+            "{err}"
+        );
+        assert_eq!(r("op://u2/x/y").find_vault(&vaults).unwrap().uuid, "u2");
+        // Without a readable personal vault, "Private" doesn't fall back to the shared one.
+        let shared_only = [vault("u3", "Private", "U")];
+        assert!(r("op://Private/x/y").find_vault(&shared_only).is_err());
+        assert_eq!(
+            r("op://u3/x/y").find_vault(&shared_only).unwrap().uuid,
+            "u3"
+        );
+    }
+
+    #[test]
+    fn unknown_field_kinds_are_concealed() {
+        let key = Arc::new(SymmetricKey::new("v", [7; 32]));
+        let mut it = item("i1", "Server", &key, "pw");
+        let details = json!({
+            "fields": [
+                {"designation": "username", "value": "root"},
+                {"designation": "password", "type": "P", "value": "pw"},
+                {"name": "pin", "type": "Z", "value": "1234"},
+                {"name": "note", "type": "T", "value": "hello"}
+            ],
+            "sections": [{"title": "SSH", "fields": [
+                {"t": "private key", "k": "sshKey", "v": "-----BEGIN OPENSSH PRIVATE KEY-----"},
+                {"t": "host", "k": "string", "v": "example.org"},
+                {"t": "token", "k": "concealed", "v": "t0k3n"},
+                {"t": "mystery", "k": "somethingNew", "v": "?"}
+            ]}]
+        });
+        it.enc_details = Some(EncryptedObject::encrypt(
+            &key,
+            "b5+json",
+            details.to_string().as_bytes(),
+        ));
+        let hidden: Vec<(String, bool)> = it
+            .fields()
+            .unwrap()
+            .into_iter()
+            .map(|f| (f.label, f.concealed))
+            .collect();
+        let expect = [
+            ("username", false),
+            ("password", true),
+            ("pin", true),
+            ("note", false),
+            ("private key", true),
+            ("host", false),
+            ("token", true),
+            ("mystery", true),
+        ];
+        assert_eq!(hidden, expect.map(|(l, c)| (l.to_string(), c)).to_vec());
+    }
+
+    #[test]
+    fn ambiguous_item_titles_are_refused() {
+        let key = Arc::new(SymmetricKey::new("v", [7; 32]));
+        let mut old = item("i3", "GitHub", &key, "old");
+        old.trashed = true;
+        let items = [
+            item("i1", "GitHub", &key, "one"),
+            item("i2", "GitHub", &key, "two"),
+            old,
+            item("i4", "AWS", &key, "aws"),
+        ];
+        let r = |s: &str| SecretReference::parse(s).unwrap();
+        let err = r("op://V/GitHub/password")
+            .resolve_in(&items)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("2 items") && err.contains("i1") && err.contains("i2"),
+            "{err}"
+        );
+        assert_eq!(
+            r("op://V/i2/password").resolve_in(&items).unwrap().as_str(),
+            "two"
+        );
+        assert_eq!(
+            r("op://V/AWS/password")
+                .resolve_in(&items)
+                .unwrap()
+                .as_str(),
+            "aws"
+        );
+    }
+
+    #[test]
+    fn plaintext_is_never_data_in_an_encrypted_session() {
+        let key = SymmetricKey::new("SID", [9; 32]);
+        let dec = |t: &str, r| decode_response("p", t, r, Some(&key));
+        // Forged data, with and without error-looking markers (review finding: errorCode null).
+        for t in [
+            r#"{"vaults": []}"#,
+            r#"{"errorCode": null, "vaults": []}"#,
+            r#"{"errorCode": "x", "vaults": []}"#,
+            r#"{"errorCode": 1.5, "vaults": []}"#,
+            r#"{"errorCode": -1, "vaults": []}"#,
+            r#"[]"#,
+            r#""text""#,
+            "",
+        ] {
+            assert!(
+                dec(t, Reply::Encrypted).is_err(),
+                "accepted plaintext {t:?}"
+            );
+        }
+        // A plaintext error object is an error, never data, and is flagged as unencrypted.
+        let e = dec(
+            r#"{"errorCode": 102, "errorMessage": "nope"}"#,
+            Reply::Encrypted,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(e, Error::Protocol(_)) && e.to_string().contains("unencrypted"),
+            "{e}"
+        );
+        // Discarded replies (2FA): anything but an error is fine, and no data comes back.
+        assert_eq!(dec("", Reply::Discarded).unwrap(), Value::Null);
+        assert_eq!(dec(r#"{"x": 1}"#, Reply::Discarded).unwrap(), Value::Null);
+        assert!(dec(r#"{"errorCode": 102}"#, Reply::Discarded).is_err());
+        assert!(dec(r#"{"errorCode": null}"#, Reply::Discarded).is_err());
+        // Before sign-in, a plaintext error is an ordinary server error.
+        let e = dec(r#"{"errorCode": 102}"#, Reply::Plain).unwrap_err();
+        assert!(matches!(e, Error::Server { status: 102, .. }), "{e}");
+        // A real envelope works, and an encrypted error is still an error.
+        let ok = serde_json::to_string(&EncryptedObject::encrypt(
+            &key,
+            "b5+jwk+json",
+            br#"{"a":1}"#,
+        ))
+        .unwrap();
+        assert_eq!(dec(&ok, Reply::Encrypted).unwrap(), json!({"a": 1}));
+        let err = serde_json::to_string(&EncryptedObject::encrypt(
+            &key,
+            "b5+jwk+json",
+            br#"{"errorCode":null}"#,
+        ))
+        .unwrap();
+        assert!(dec(&err, Reply::Encrypted).is_err());
+        // An envelope under another key (another session) fails.
+        let other = SymmetricKey::new("OTHER", [9; 32]);
+        let wrong = serde_json::to_string(&EncryptedObject::encrypt(
+            &other,
+            "b5+jwk+json",
+            br#"{"a":1}"#,
+        ))
+        .unwrap();
+        assert!(dec(&wrong, Reply::Encrypted).is_err());
+    }
+
+    #[test]
+    fn only_onepassword_domains_are_accepted() {
+        let ok = |a: &str| check_onepassword_host(&Url::parse(a).unwrap()).is_ok();
+        assert!(ok("https://my.1password.com/api/"));
+        assert!(ok("https://MY.1Password.EU/api/"));
+        assert!(ok("https://acme.ent.1password.com/api/"));
+        assert!(ok("https://1password.ca/api/"));
+        assert!(!ok("https://my.1passw0rd.com/api/"), "look-alike");
+        assert!(
+            !ok("https://my.1password.com.evil.example/api/"),
+            "suffix trick"
+        );
+        assert!(
+            !ok("https://evil1password.com/api/"),
+            "no dot before the domain"
+        );
+        assert!(!ok("http://my.1password.com/api/"), "plain http");
+        // "user@host": the URL parser sees evil.example as the host.
+        assert!(!ok(&format!(
+            "https://{}/api/",
+            "my.1password.com@evil.example"
+        )));
+        assert!(
+            !ok("https://user@my.1password.com/api/"),
+            "credentials in the URL"
+        );
+    }
+
+    #[test]
+    fn low_iteration_counts_are_refused() {
+        assert!(check_iterations(650_000, MIN_KDF_ITERATIONS).is_ok());
+        assert!(check_iterations(100_000, MIN_KDF_ITERATIONS).is_ok());
+        assert!(check_iterations(99_999, MIN_KDF_ITERATIONS).is_err());
+        assert!(check_iterations(1, MIN_KDF_ITERATIONS).is_err());
+    }
+
+    #[test]
+    fn wipe_json_zeroes_all_strings() {
+        let mut v =
+            json!({"password": "hunter2", "sections": [{"fields": [{"v": "s3cret", "n": 5}]}]});
+        wipe_json(&mut v);
+        assert_eq!(
+            v,
+            json!({"password": "", "sections": [{"fields": [{"v": "", "n": 5}]}]})
+        );
+    }
+
+    #[test]
+    fn details_debug_is_redacted() {
+        let d = Details::new(json!({"password": "hunter2"}));
+        assert_eq!(format!("{d:?}"), "Details(<redacted>)");
+        assert_eq!(d["password"], "hunter2");
+    }
+
+    #[test]
+    fn field_debug_is_redacted() {
+        let f = Field {
+            section: None,
+            label: "password".into(),
+            value: Zeroizing::new("hunter2".into()),
+            concealed: true,
+        };
+        let s = format!("{f:?}");
+        assert!(s.contains("password") && !s.contains("hunter2"), "{s}");
+    }
+}
+
+/// Entry points for the fuzz targets in `fuzz/` (only built with `--cfg fuzzing`).
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub mod fuzzing {
+    use super::*;
+
+    /// Runs the response decoder on arbitrary bytes, with and without a session key.
+    pub fn decode_response(text: &[u8]) {
+        let text = String::from_utf8_lossy(text);
+        let key = SymmetricKey::new("SESSIONID", [9; 32]);
+        for reply in [Reply::Plain, Reply::Encrypted, Reply::Discarded] {
+            let _ = super::decode_response("fuzz", &text, reply, Some(&key));
+            let _ = super::decode_response("fuzz", &text, reply, None);
+        }
+    }
+
+    /// Runs `Item::fields` / `Item::field` on arbitrary decrypted details.
+    pub fn item_fields(details: &[u8], name: &str) {
+        let key = Arc::new(SymmetricKey::new("vault", [7; 32]));
+        let item = Item {
+            uuid: "u".into(),
+            template_uuid: "001".into(),
+            trashed: false,
+            overview: json!({"title": "t"}),
+            enc_details: Some(EncryptedObject::encrypt(&key, "b5+json", details)),
+            key,
+        };
+        let _ = item.fields();
+        let _ = item.field(name);
+        let _ = item.details().map(|d| format!("{d:?}"));
     }
 }

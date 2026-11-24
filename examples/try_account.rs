@@ -46,10 +46,10 @@ fn ask_hidden(var: &str, prompt: &str) -> io::Result<Zeroizing<String>> {
 fn device_uuid() -> String {
     let path =
         PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".config/onepw/device-uuid");
-    if let Ok(s) = std::fs::read_to_string(&path) {
-        if s.trim().len() == 26 {
-            return s.trim().to_string();
-        }
+    if let Ok(s) = std::fs::read_to_string(&path)
+        && s.trim().len() == 26
+    {
+        return s.trim().to_string();
     }
     let id = new_device_uuid();
     let _ = std::fs::create_dir_all(path.parent().unwrap());

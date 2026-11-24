@@ -5,13 +5,14 @@ use std::fmt;
 
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
-use rand::RngCore;
-use rsa::{BigUint as RsaBigUint, Oaep, RsaPrivateKey};
+use rand::Rng;
+use rsa::{BoxedUint, Oaep, PrivateKey as RsaPrivateKey};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 use crate::b64;
 use crate::error::{Error, Result};
+use crate::locked::Locked;
 
 /// The "encrypted object" envelope used everywhere in 1Password:
 /// `{"kid":…,"enc":"A256GCM","cty":"b5+jwk+json","iv":…,"data":…}`, plus `alg`/`p2s`/`p2c` when
@@ -62,7 +63,10 @@ impl EncryptedObject {
         let data = b64::decode(&self.data)?;
         let cipher = Aes256Gcm::new_from_slice(key.key.as_ref()).expect("32-byte key");
         cipher
-            .decrypt(Nonce::from_slice(&iv), data.as_ref())
+            .decrypt(
+                &Nonce::try_from(iv.as_slice()).expect("checked: 12 bytes"),
+                data.as_ref(),
+            )
             .map(Zeroizing::new)
             .map_err(|_| {
                 Error::Decrypt(format!(
@@ -81,10 +85,13 @@ impl EncryptedObject {
     /// Encrypts `plaintext` with a fresh random nonce.
     pub fn encrypt(key: &SymmetricKey, cty: &str, plaintext: &[u8]) -> Self {
         let mut iv = [0u8; 12];
-        rand::thread_rng().fill_bytes(&mut iv);
+        rand::rng().fill_bytes(&mut iv);
         let cipher = Aes256Gcm::new_from_slice(key.key.as_ref()).expect("32-byte key");
         let data = cipher
-            .encrypt(Nonce::from_slice(&iv), plaintext)
+            .encrypt(
+                &Nonce::try_from(iv.as_slice()).expect("checked: 12 bytes"),
+                plaintext,
+            )
             .expect("AES-GCM encryption cannot fail");
         EncryptedObject {
             kid: key.kid.clone(),
@@ -99,19 +106,20 @@ impl EncryptedObject {
     }
 }
 
-/// An AES-256-GCM key with its key ID. Zeroed on drop, redacted in `Debug`.
+/// An AES-256-GCM key with its key ID. Kept in its own locked memory page (not swapped to disk),
+/// zeroed on drop, redacted in `Debug`.
 #[derive(Clone)]
 pub struct SymmetricKey {
     kid: String,
-    key: Zeroizing<[u8; 32]>,
+    key: Locked<32>,
 }
 
 impl SymmetricKey {
     /// Wraps raw key bytes.
-    pub fn new(kid: impl Into<String>, key: [u8; 32]) -> Self {
+    pub fn new(kid: impl Into<String>, mut key: [u8; 32]) -> Self {
         SymmetricKey {
             kid: kid.into(),
-            key: Zeroizing::new(key),
+            key: Locked::take(&mut key),
         }
     }
 
@@ -142,6 +150,11 @@ impl SymmetricKey {
     /// Raw key bytes.
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.key
+    }
+
+    /// A copy of the key bytes in their own locked page.
+    pub(crate) fn as_bytes_locked(&self) -> Locked<32> {
+        self.key.clone()
     }
 }
 
@@ -226,17 +239,29 @@ impl PrivateKey {
                 jwk.kty
             )));
         }
-        let int = |name: &str, v: &Option<String>| -> Result<RsaBigUint> {
+        let bytes = |name: &str, v: &Option<String>| -> Result<Zeroizing<Vec<u8>>> {
             let s = v
                 .as_deref()
                 .ok_or_else(|| Error::Malformed(format!("RSA JWK without {name}")))?;
-            Ok(RsaBigUint::from_bytes_be(&b64::decode(s)?))
+            Ok(Zeroizing::new(b64::decode(s)?))
         };
+        // Like rsa's own PKCS#1 decoder: n's byte length sets the precision of n, d, p and q
+        // (rounded up to whole 64-bit limbs), so parsing doesn't depend on the secret values.
+        let n = bytes("n", &jwk.n)?;
+        let bits = (n.len() as u32 * 8).div_ceil(64) * 64;
+        let int = |b: &[u8], bits: u32| {
+            BoxedUint::from_be_slice(b, bits)
+                .map_err(|_| Error::Malformed("RSA JWK component too large".into()))
+        };
+        let e = bytes("e", &jwk.e)?;
         let key = RsaPrivateKey::from_components(
-            int("n", &jwk.n)?,
-            int("e", &jwk.e)?,
-            int("d", &jwk.d)?,
-            vec![int("p", &jwk.p)?, int("q", &jwk.q)?],
+            int(&n, bits)?,
+            int(&e, (e.len() as u32 * 8).div_ceil(64).max(1) * 64)?,
+            int(&bytes("d", &jwk.d)?, bits)?,
+            vec![
+                int(&bytes("p", &jwk.p)?, bits)?,
+                int(&bytes("q", &jwk.q)?, bits)?,
+            ],
         )
         .map_err(|e| Error::Malformed(format!("RSA key: {e}")))?;
         let hash = match jwk.alg.as_deref() {
@@ -259,8 +284,14 @@ impl PrivateKey {
     /// Decrypts an RSA-OAEP ciphertext.
     pub fn decrypt(&self, ciphertext: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
         let res = match self.hash {
-            OaepHash::Sha256 => self.key.decrypt(Oaep::new::<sha2::Sha256>(), ciphertext),
-            OaepHash::Sha1 => self.key.decrypt(Oaep::new::<sha1::Sha1>(), ciphertext),
+            OaepHash::Sha256 => {
+                self.key
+                    .decrypt_blinded(&mut rand::rng(), Oaep::<sha2::Sha256>::new(), ciphertext)
+            }
+            OaepHash::Sha1 => {
+                self.key
+                    .decrypt_blinded(&mut rand::rng(), Oaep::<sha1::Sha1>::new(), ciphertext)
+            }
         };
         res.map(Zeroizing::new)
             .map_err(|_| Error::Decrypt(format!("RSA-OAEP with key {:?}", self.kid)))
@@ -278,8 +309,14 @@ impl PrivateKey {
         let ct = b64::decode(&obj.data)?;
         // The object's `enc` says which OAEP hash was used; fall back to the key's own `alg`.
         let res = match obj.enc.as_str() {
-            "RSA-OAEP-256" => self.key.decrypt(Oaep::new::<sha2::Sha256>(), &ct),
-            "RSA-OAEP" => self.key.decrypt(Oaep::new::<sha1::Sha1>(), &ct),
+            "RSA-OAEP-256" => {
+                self.key
+                    .decrypt_blinded(&mut rand::rng(), Oaep::<sha2::Sha256>::new(), &ct)
+            }
+            "RSA-OAEP" => {
+                self.key
+                    .decrypt_blinded(&mut rand::rng(), Oaep::<sha1::Sha1>::new(), &ct)
+            }
             other => {
                 return Err(Error::Unsupported(format!(
                     "vault key encryption {other:?}"
@@ -471,16 +508,16 @@ mod tests {
     #[test]
     fn keyset_chain_round_trip() {
         // Build a keyset the way the 1Password clients do, then decrypt it again.
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let auk = SymmetricKey::new("mp", [1u8; 32]);
         let sym = SymmetricKey::new("ks1", [2u8; 32]);
         let rsa = RsaPrivateKey::new(&mut rng, 2048).unwrap();
-        let enc = |n: &RsaBigUint| b64::encode(&n.to_bytes_be());
+        let enc = |n: &BoxedUint| b64::encode(&n.to_be_bytes_trimmed_vartime());
         use rsa::traits::{PrivateKeyParts, PublicKeyParts};
         let pri = serde_json::json!({
             "kty": "RSA", "kid": "ks1", "alg": "RSA-OAEP-256",
-            "n": enc(rsa.n()), "e": enc(rsa.e()), "d": enc(rsa.d()),
-            "p": enc(&rsa.primes()[0]), "q": enc(&rsa.primes()[1]),
+            "n": enc(rsa.n().as_ref()), "e": enc(rsa.e()), "d": enc(rsa.d()),
+            "p": enc(rsa.primes()[0].as_ref()), "q": enc(rsa.primes()[1].as_ref()),
         });
         let sym_jwk = serde_json::json!({"kty":"oct","alg":"A256GCM","kid":"ks1","k": b64::encode(sym.as_bytes())});
         let ks = EncryptedKeyset {
@@ -502,7 +539,7 @@ mod tests {
         let vault_key = br#"{"kty":"oct","alg":"A256GCM","kid":"vault1","k":"AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE"}"#;
         let ct = rsa
             .to_public_key()
-            .encrypt(&mut rng, Oaep::new::<sha2::Sha256>(), vault_key)
+            .encrypt(&mut rng, Oaep::<sha2::Sha256>::new(), vault_key)
             .unwrap();
         let wrapped = EncryptedObject {
             kid: "ks1".into(),

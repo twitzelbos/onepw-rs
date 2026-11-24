@@ -14,11 +14,30 @@
 //!
 //! `x` is not computed here: in 1Password it comes from two-secret key derivation (see
 //! [`crate::kdf`]).
+//!
+//! # Constant time
+//!
+//! Everything that involves a secret (the ephemeral `a`, the password-derived `x`, and the
+//! premaster secret `S`) is computed with `crypto-bigint` in Montgomery form, with exponents
+//! processed over a fixed 1024 bits ([`EXP_BITS`]), so timing doesn't depend on their values.
+//! Public values (N, g, k, A, B, u, the verifier) use `num-bigint-dig` for convenience. Not
+//! constant time: the hex encoding of `S` for `K = SHA256(hex(S))` strips leading zero digits,
+//! as 1Password's protocol requires, which can leak how many leading zero nibbles S has.
 
-use num_bigint_dig::{BigUint, RandBigInt};
+/// 4096-bit Montgomery form (the group modulus).
+type Monty = FixedMontyForm<{ U4096::LIMBS }>;
+type MontyParams = FixedMontyParams<{ U4096::LIMBS }>;
+
+/// Bit length every secret exponent (`a`, `x`, `u·x + a`) is processed with. `a` is at most
+/// 304 bits, `x` and `u` 256, so `u·x + a` < 2^513.
+pub const EXP_BITS: u32 = 1024;
+
+use crypto_bigint::modular::{FixedMontyForm, FixedMontyParams};
+use crypto_bigint::{Odd, U1024, U4096};
+use num_bigint_dig::BigUint;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 use crate::error::{Error, Result};
 
@@ -31,6 +50,7 @@ pub struct Group {
     exponent_size: usize,
     /// Label used by 1Password's Go library, e.g. `"5054A4096"`.
     pub label: &'static str,
+    params: MontyParams,
 }
 
 /// RFC 3526 group 16 / RFC 5054 4096-bit group, g = 5. This is what `"SRPg-4096"` refers to.
@@ -56,11 +76,15 @@ pub fn rfc5054_4096() -> Group {
         "D5B05AA993B4EA988D8FDDC186FFB7DC90A6C08F4DF435C934063199",
         "FFFFFFFFFFFFFFFF",
     );
+    let n = BigUint::parse_bytes(N_HEX.as_bytes(), 16).expect("valid group prime");
+    let odd = Odd::new(public_u4096(&n)).expect("N is odd");
     Group {
-        n: BigUint::parse_bytes(N_HEX.as_bytes(), 16).expect("valid group prime"),
+        n,
         g: BigUint::from(5u32),
         exponent_size: 38,
         label: "5054A4096",
+        // The modulus is public, so the variable-time setup is fine.
+        params: MontyParams::new_vartime(odd),
     }
 }
 
@@ -110,6 +134,47 @@ impl Group {
     }
 }
 
+/// A public value as a 4096-bit integer. Panics if it has more than 4096 bits (callers reduce
+/// mod N first).
+fn public_u4096(v: &BigUint) -> U4096 {
+    let bytes = v.to_bytes_be();
+    assert!(bytes.len() <= 512, "value exceeds 4096 bits");
+    let mut buf = [0u8; 512];
+    buf[512 - bytes.len()..].copy_from_slice(&bytes);
+    U4096::from_be_slice(&buf)
+}
+
+/// A secret big-endian integer (at most 64 bytes) as a 1024-bit exponent.
+fn secret_exponent(bytes: &[u8]) -> Zeroizing<U1024> {
+    assert!(bytes.len() <= 64, "secret exponent longer than 512 bits");
+    let mut buf = Zeroizing::new([0u8; 128]);
+    buf[128 - bytes.len()..].copy_from_slice(bytes);
+    Zeroizing::new(U1024::from_be_slice(buf.as_ref()))
+}
+
+impl Group {
+    fn monty(&self, v: &BigUint) -> Monty {
+        Monty::new(&public_u4096(&(v % &self.n)), &self.params)
+    }
+
+    /// `g^e mod N` in constant time over [`EXP_BITS`] exponent bits.
+    fn g_pow_secret(&self, e: &U1024) -> Monty {
+        self.monty(&self.g).pow_bounded_exp(e, EXP_BITS)
+    }
+}
+
+/// Lowercase hex digit for a nibble, branch-free: `'0' + n`, plus 39 more for `a`–`f`.
+fn hex_digit(n: u8) -> u8 {
+    let n = n & 0x0f;
+    // (9 - n) >> 7 is 1 when n > 9 (wrapping subtraction sets the top bit), else 0.
+    let above_nine = 9u8.wrapping_sub(n) >> 7;
+    b'0' + n + above_nine * 39
+}
+
+fn monty_to_biguint(m: &Monty) -> BigUint {
+    BigUint::from_bytes_be(m.retrieve().to_be_bytes().as_ref())
+}
+
 /// Which generation of 1Password's SRP math to use.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Variant {
@@ -136,10 +201,16 @@ impl Client {
     ///
     /// `x` is the 32-byte SRP secret from 2SKD. `k` is the multiplier; `None` uses
     /// [`Group::default_k`].
+    ///
+    /// # Panics
+    ///
+    /// If `x` is longer than 64 bytes (the constant-time maths is sized for at most 512-bit
+    /// secrets; 1Password's `x` is 32 bytes).
     pub fn new(group: Group, x: &[u8], k: Option<BigUint>) -> Self {
-        let len = group.exponent_size.max(32);
-        let a = rand::thread_rng().gen_biguint(len * 8);
-        Self::with_ephemeral(group, x, k, &a.to_bytes_be())
+        use rand::Rng;
+        let mut a = Zeroizing::new(vec![0u8; group.exponent_size.max(32)]);
+        rand::rng().fill_bytes(&mut a);
+        Self::with_ephemeral(group, x, k, &a)
     }
 
     /// Starts an exchange for the **current** 1Password login flow ([`Variant::Standard`]).
@@ -169,10 +240,13 @@ impl Client {
     }
 
     /// Starts an exchange with a given ephemeral secret `a` (big-endian). For tests only.
+    ///
+    /// # Panics
+    ///
+    /// If `x` or `a` is longer than 64 bytes.
     pub fn with_ephemeral(group: Group, x: &[u8], k: Option<BigUint>, a: &[u8]) -> Self {
         let k = k.unwrap_or_else(|| group.default_k());
-        let a_int = BigUint::from_bytes_be(a);
-        let big_a = group.g.modpow(&a_int, &group.n);
+        let big_a = monty_to_biguint(&group.g_pow_secret(&secret_exponent(a)));
         Client {
             variant: Variant::Legacy,
             group,
@@ -191,9 +265,7 @@ impl Client {
     /// The verifier `v = g^x mod N`. A client only needs this when registering or changing
     /// credentials.
     pub fn verifier(&self) -> BigUint {
-        self.group
-            .g
-            .modpow(&BigUint::from_bytes_be(&self.x), &self.group.n)
+        monty_to_biguint(&self.group.g_pow_secret(&secret_exponent(&self.x)))
     }
 
     /// Computes the shared session key from the server's public value B.
@@ -254,17 +326,27 @@ impl Client {
         if *u == BigUint::from(0u32) {
             return Err(Error::Protocol("SRP scrambling parameter u is zero".into()));
         }
-        let x = BigUint::from_bytes_be(&self.x);
-        let a = BigUint::from_bytes_be(&self.a);
-        let kgx = (&self.k * self.group.g.modpow(&x, n)) % n;
-        let base = (b_mod + n - kgx) % n;
-        let exponent = u * &x + &a;
-        let mut s = base.modpow(&exponent, n);
-        let mut s_hex = format!("{s:x}");
-        let key: [u8; 32] = Sha256::digest(s_hex.as_bytes()).into();
-        s_hex.zeroize();
-        s.zeroize();
-        Ok(SessionKey(Zeroizing::new(key)))
+        // S = (B - k·g^x)^(u·x + a) mod N, all secret-dependent steps in constant time.
+        let x = secret_exponent(&self.x);
+        let a = secret_exponent(&self.a);
+        let kgx = Zeroizing::new(self.group.monty(&self.k) * self.group.g_pow_secret(&x));
+        let base = Zeroizing::new(self.group.monty(&b_mod) - *kgx);
+        // u is public; u·x + a < 2^513, so 1024-bit wrapping arithmetic is exact.
+        let u = secret_exponent(&u.to_bytes_be());
+        let exponent = Zeroizing::new(u.wrapping_mul(&*x).wrapping_add(&*a));
+        let s = Zeroizing::new(base.pow_bounded_exp(&*exponent, EXP_BITS));
+        let s_bytes = Zeroizing::new(s.retrieve().to_be_bytes());
+        // Hex without data-dependent branches (`{:02x}` branches on each digit).
+        let mut hex = Zeroizing::new(vec![0u8; s_bytes.as_ref().len() * 2]);
+        for (i, b) in s_bytes.as_ref().iter().enumerate() {
+            hex[2 * i] = hex_digit(b >> 4);
+            hex[2 * i + 1] = hex_digit(b & 0x0f);
+        }
+        let s_hex = std::str::from_utf8(&hex).expect("ASCII hex");
+        let trimmed = s_hex.trim_start_matches('0');
+        let mut key: [u8; 32] =
+            Sha256::digest(if trimmed.is_empty() { "0" } else { trimmed }.as_bytes()).into();
+        Ok(SessionKey(crate::locked::Locked::take(&mut key)))
     }
 
     /// Checks the server's proof `M` (the server proves first in 1Password's variant) and, if it
@@ -347,8 +429,8 @@ pub fn compute_u(big_a: &BigUint, big_b: &BigUint) -> BigUint {
     BigUint::from_bytes_be(&h.finalize())
 }
 
-/// The 32-byte SRP session key `K`. Zeroed on drop and never printed.
-pub struct SessionKey(Zeroizing<[u8; 32]>);
+/// The 32-byte SRP session key `K`. In locked memory, zeroed on drop and never printed.
+pub struct SessionKey(crate::locked::Locked<32>);
 
 impl SessionKey {
     /// Raw key bytes.
@@ -369,6 +451,14 @@ mod u_vectors;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A uniformly random integer of `bits` bits (test helper).
+    fn random_biguint(bits: usize) -> BigUint {
+        use rand::Rng;
+        let mut b = vec![0u8; bits.div_ceil(8)];
+        rand::rng().fill_bytes(&mut b);
+        BigUint::from_bytes_be(&b)
+    }
 
     fn int(h: &str) -> BigUint {
         BigUint::parse_bytes(h.as_bytes(), 16).unwrap()
@@ -454,7 +544,7 @@ mod tests {
         let client = Client::new_standard(g.clone(), &x);
         let v = client.verifier();
         let k = g.standard_k();
-        let b = rand::thread_rng().gen_biguint(256);
+        let b = random_biguint(256);
         let big_b = ((&k * &v) % g.n() + g.g().modpow(&b, g.n())) % g.n();
         let mut h = Sha256::new();
         h.update(g.pad(client.public_a()));
@@ -495,6 +585,16 @@ mod tests {
     }
 
     #[test]
+    fn branch_free_hex_digits() {
+        for n in 0..16u8 {
+            assert_eq!(
+                hex_digit(n) as char,
+                format!("{n:x}").chars().next().unwrap()
+            );
+        }
+    }
+
+    #[test]
     fn server_hex_round_trip() {
         let v = int("000abc");
         assert_eq!(server_hex(&v), "abc");
@@ -520,7 +620,7 @@ mod tests {
         let client = Client::new(g.clone(), &x, None);
         let v = client.verifier();
         let k = g.default_k();
-        let b = rand::thread_rng().gen_biguint(38 * 8);
+        let b = random_biguint(38 * 8);
         let big_b = ((&k * &v) % g.n() + g.g().modpow(&b, g.n())) % g.n();
 
         let u = compute_u(client.public_a(), &big_b);

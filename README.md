@@ -24,7 +24,7 @@ Version 0.2 is experimental, and the API will change.
 
 ```toml
 [dependencies]
-onepw = "0.2"
+onepw = "0.3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
@@ -101,7 +101,7 @@ onepw account touch-id on | off            # macOS only: Touch ID instead of the
 - **Secret Key:** stored in the macOS Keychain (or the Linux kernel keyring) under the service `onepw`. Settings (address, email, device ID) go in `~/.config/onepw/config.json`. You can also set `ONEPW_SECRET_KEY`.
 - **Account password:** **never stored**. It's asked for (hidden) on every command, or read from `ONEPW_PASSWORD`. Keeping it next to the Secret Key would undo 1Password's two-secret design.
 - **Touch ID (macOS only):** `onepw account touch-id on` asks for the password once, then stores the *derived* unlock keys (not the password) in the Keychain behind Touch ID. Builds signed with a Developer ID and the right entitlement get a Secure Enclave-enforced item. Others get an item that only onepw reads, after its own Touch ID check. A cancelled prompt or out-of-date keys fall back to the password.
-- **`run`:** every environment variable, from your shell or from `--env-file` lines `KEY=op://vault/item/field`, whose value starts with `op://` is replaced before the command starts. The command's exit code is passed through.
+- **`run`:** every environment variable, from your shell or from `--env-file` lines `KEY=op://vault/item/field`, whose value starts with `op://` is replaced before the command starts. The command's exit code is passed through. onepw's own `ONEPW_*` variables (password, Secret Key) are removed from the command's environment.
 - **Cost:** each command is a full sign-in (≈1 s, mostly the 650 000-round key derivation). `run` resolves all references with one sign-in.
 
 ## Manual
@@ -135,10 +135,11 @@ opts.identity.device_name = "my-backup-tool".into(); // shown in your account's 
 | Call | Returns |
 |---|---|
 | `account.vaults()` | Vaults you can read, with their keys unlocked. `vault.name()`, `vault.vault_type` (`P` personal, `E` everyone, `U` user-made), `vault.attrs` |
-| `account.items(&vault)` | Every item, decrypted, **including trashed ones** (check `item.trashed`) |
+| `account.items(&vault)` | Every item, **including trashed ones** (check `item.trashed`). Only the overview (title, URLs, tags) is decrypted; fields and passwords stay encrypted until you ask for them |
 | `item.title()` | Item title |
-| `item.field("username" \| "password" \| "credential" \| <label>)` | A field by designation, name or section label |
-| `item.overview` / `item.details` | The raw decrypted JSON (`URLs`, `tags`, `sections`, `notesPlain`, …) |
+| `item.field("username" \| "password" \| "credential" \| <label>)?` | `Option<Zeroizing<String>>`: a field by designation, name or section label |
+| `item.fields()?` | All non-empty fields (`label`, `section`, `value: Zeroizing<String>`, `concealed`) |
+| `item.overview` / `item.details()?` | The raw decrypted JSON (`URLs`, `tags` / `sections`, `notesPlain`, …). `details()` returns a `Details` that wipes its strings on drop |
 | `account.read("op://vault/item/field")` | One value. Vault and item can be names or UUIDs. `Private` also matches your personal vault |
 | `account.sign_out()` | Ends the server session |
 
@@ -191,10 +192,48 @@ Your password and Secret Key never leave the process. The server only sees SRP v
 
 ## Security notes
 
-- Secrets (password, Secret Key, derived keys, the session key, decrypted key material) are held in `Zeroizing` buffers and redacted from `Debug` output. **Decrypted item JSON (`item.details`) is a `serde_json::Value` and can't be zeroed**, so drop items as soon as you're done with them.
-- The crate contains no `unsafe` (`#![forbid(unsafe_code)]`).
-- The crypto uses the RustCrypto crates (`aes-gcm`, `rsa`, `hkdf`, `pbkdf2`, `hmac`, `sha2`). Nothing is home-made except 1Password's composition of them.
-- This code has **not** had a security review. Treat it accordingly.
+### What onepw protects
+
+- **Keys in locked memory:** the session key, the Account Unlock Key, the SRP secret `x` (as stored in `UnlockKeys`) and every AES key (keyset and vault keys) each live in their own `mlock`ed memory page: not written to swap, excluded from core dumps on Linux, zeroed before being freed. If the OS refuses to lock (a low `RLIMIT_MEMLOCK` on Linux), they're still zeroed on drop.
+- **Other credentials** (your password, Secret Key, decrypted key material in transit) are held in `Zeroizing` buffers (overwritten with zeros when dropped) and redacted from `Debug` output.
+- **Item secrets are decrypted only on demand.** `account.items()` keeps each item's fields, passwords and notes encrypted. `field()`, `fields()` and `details()` decrypt one item for that call only, return values that are wiped on drop (`Zeroizing<String>`, `Details`), and wipe the intermediate JSON.
+- **No accidental printing:** `Debug` on `Item`, `Field` and `Details` never shows values. `onepw item get` hides every field whose type isn't known to be plain text (so new kinds of secrets, such as SSH keys, are hidden by default) unless you pass `--reveal`.
+- **Nothing is written to disk.** The CLI keeps no cache file and disables core dumps at startup.
+- **Interception:** after sign-in, every server response must be an envelope encrypted with the SRP session key. Plaintext (which only someone between you and the server, such as a TLS-inspecting proxy, could inject) is refused, and a plaintext error object is only ever treated as an error, never as data. Redirects are never followed.
+- **Look-alike sign-in addresses:** only `*.1password.com`, `*.1password.ca` and `*.1password.eu` over HTTPS are accepted (`SignInOptions::allow_any_host` overrides this), because the client sends its SRP proof before the server proves itself.
+- **Weak key derivation:** a server asking for fewer than 100 000 PBKDF2 iterations (for sign-in or for the Account Unlock Key) is refused (`SignInOptions::min_kdf_iterations`).
+- **Look-alike vault and item names:** an `op://` reference or `onepw item get [--vault]` whose vault or item name matches more than one is an error. `Private` always means your personal vault and never matches a shared vault named "Private". UUIDs always work.
+- **Side channels in the crypto:** the SRP maths on your secrets runs in constant time (`crypto-bigint`, fixed 1024-bit exponents), and RSA decryption uses `rsa` 0.10 with blinding (fixing the Marvin timing attack, RUSTSEC-2023-0071).
+- **A hostile or broken server** can't hang onepw (connect and request timeouts) or make it page through items forever, and its memory use is bounded (a response over 64 MiB, or more than 256 MiB of item data per vault, is refused).
+- **`onepw run` never passes onepw's own credentials** (`ONEPW_PASSWORD`, `ONEPW_SECRET_KEY`, any `ONEPW_*`) to the command.
+
+### ⚠️ What onepw does NOT protect
+
+Read this before relying on onepw for anything sensitive. Memory wiping reduces how long secrets linger; it is not a guarantee.
+
+| Gap | What it means | What you can do |
+|---|---|---|
+| **Your own copies** | `.to_string()`, `.clone()` into a plain `String`, `format!`, `serde_json::to_string(&*details)` and similar make copies that are **not** wiped | Keep values in `Zeroizing<String>`; use them by reference (`&*value`) |
+| **Only keys are locked** | Item values, your password, the Secret Key, RSA private keys (held inside the `rsa` crate) and the SRP working copies of `x` and `a` are zeroed but **not** `mlock`ed, so they can reach swap | macOS encrypts swap by default; on Linux, use encrypted swap or none |
+| **JSON parser scratch buffer** | When a decrypted string contains escape characters (`"`, `\`, control or some Unicode characters), `serde_json` copies it through an internal buffer that is freed without being wiped | None inside onepw today |
+| **Freed heap memory in general** | Anything not listed as protected above (error messages, HTTP buffers inside `reqwest`/`rustls`, the Keychain's own copies, allocator leftovers) may stay in freed memory until reused | Keep the process short-lived (the CLI exits after each command) |
+| **`ONEPW_PASSWORD`** | If you use it, the password sits in onepw's environment block for the life of the process (and in your shell's) | Prefer the prompt or Touch ID |
+| **Terminal and stdout** | Whatever `onepw read` or `onepw item get --reveal` prints goes through stdout's buffer and into your terminal's scrollback (and tmux's history), outside onepw's control | Prefer `onepw run` or piping straight into the program that needs the value. Piping to `pbcopy` avoids scrollback but puts the secret on the clipboard, where clipboard-history tools (e.g. Raycast's) keep it. Clear scrollback afterwards |
+| **`onepw run`** | The resolved secrets are handed to the child process as **environment variables** (as `op run` does). The child, and anything it starts, inherits them; programs may log their environment; on Linux, root and the same user can read `/proc/<pid>/environ` | Only `run` programs you trust, for as short as possible |
+| **Shell history** | `op://` references are not secret, but a value you paste on the command line is | Never type secret values on the command line |
+| **Malware running as your user** | It can attach a debugger, read process memory, read the Keychain items it is allowed to, or log keystrokes. No in-process protection stops that | Keep your machine clean; a signed build with the hardened runtime and the Secure Enclave level raises the bar |
+| **A malicious or compromised 1Password server** | It can offer you vaults and items it made (encrypted to your public key, which isn't secret) or swap encrypted parts between items: 1Password's format doesn't tie an item's ciphertext to its ID. onepw doesn't yet remember keys it has seen | Use UUIDs in `op://` references for anything important |
+| **Touch ID fallback level** | On unsigned builds (`Protection::TouchIdGate`), Touch ID is checked by onepw, not enforced by the hardware. Malware running as you can launch the (trusted) onepw binary with an injected library, since unsigned builds have no hardened runtime, and read the stored unlock keys without any prompt | Use a signed build for the Secure Enclave level (`Protection::Biometry`) |
+| **Remaining timing leak in SRP** | `K = SHA256(hex(S))` strips leading zero digits of `S`, as 1Password's protocol requires, which can reveal how many leading zeros `S` has | None (protocol-defined) |
+| **Several fields with the same label** | `item.field("x")` / `op://…/x` returns the first matching field (top-level, then sections) without an ambiguity check | Check the item in 1Password if a label is reused |
+| **No professional audit** | onepw has had an automated, independent code review (findings fixed in 0.3.0) and fuzzing, but **no** professional security audit | Treat it accordingly |
+
+### Other notes
+
+- Threat model and how to report a vulnerability: [SECURITY.md](SECURITY.md).
+- `unsafe` is denied crate-wide (`#![deny(unsafe_code)]`) and allowed in three places only: the locked-memory allocator (`mlock`/`madvise`), the macOS Touch ID module (Objective-C calls), and the CLI's one `setrlimit` call.
+- The crypto uses the RustCrypto crates (`aes-gcm`, `rsa`, `hkdf`, `pbkdf2`, `hmac`, `sha2`, `crypto-bigint`). Nothing is home-made except 1Password's composition of them.
+- Parsers of server data, secret references and Secret Keys are fuzzed (`fuzz/`, weekly in CI); dependencies are checked with `cargo-deny` (RustSec advisories, licenses, sources) on every push.
 
 ## Development
 

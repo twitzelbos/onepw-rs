@@ -15,7 +15,9 @@
 //! * [`Protection::TouchIdGate`]: fallback for unsigned builds. onepw asks for Touch ID through
 //!   LocalAuthentication and then reads a normal keychain item, whose ACL trusts only the
 //!   binary that created it (other programs make macOS ask you first). The Touch ID check here is
-//!   enforced by onepw, not by the hardware.
+//!   enforced by onepw, not by the hardware, and it doesn't stop malware running as you: it can
+//!   launch the trusted onepw binary with an injected library (unsigned builds have no hardened
+//!   runtime) and read the item without a prompt. Use a signed build for real protection.
 
 use std::sync::mpsc;
 
@@ -23,7 +25,9 @@ use block2::RcBlock;
 use objc2::runtime::Bool;
 use objc2_foundation::{NSError, NSString};
 use objc2_local_authentication::{LAContext, LAPolicy};
+use security_framework::access_control::{ProtectionMode, SecAccessControl};
 use security_framework::passwords::{self, AccessControlOptions, PasswordOptions};
+use zeroize::Zeroizing;
 
 use crate::client::UnlockKeys;
 use crate::error::{Error, Result};
@@ -57,6 +61,12 @@ pub fn is_available() -> bool {
 
 /// Shows the Touch ID prompt with `reason` (shown as "onepw wants to `reason`") and waits for the result.
 pub fn authenticate(reason: &str) -> Result<()> {
+    if reason.trim().is_empty() {
+        // LocalAuthentication raises an Objective-C exception for an empty reason.
+        return Err(Error::InvalidInput(
+            "Touch ID: the reason must not be empty".into(),
+        ));
+    }
     // SAFETY: LAContext is created and used on this thread; the reply block only sends on a channel.
     unsafe {
         let ctx = LAContext::new();
@@ -105,7 +115,14 @@ pub fn save(account: &str, keys: &UnlockKeys) -> Result<Protection> {
     let _ = delete(account);
 
     let mut o = biometry_options(account);
-    o.set_access_control_options(AccessControlOptions::BIOMETRY_CURRENT_SET);
+    // ThisDeviceOnly: the item never leaves this Mac (not in backups, not migrated to a new
+    // machine), and it's deleted if the device passcode is removed.
+    let access = SecAccessControl::create_with_protection(
+        Some(ProtectionMode::AccessibleWhenPasscodeSetThisDeviceOnly),
+        AccessControlOptions::BIOMETRY_CURRENT_SET.bits(),
+    )
+    .map_err(|e| Error::Protocol(format!("keychain access control: {e}")))?;
+    o.set_access_control(access);
     match passwords::set_generic_password_options(bytes.as_ref(), o) {
         Ok(()) => return Ok(Protection::Biometry),
         Err(e) if e.code() == ERR_MISSING_ENTITLEMENT => {}
@@ -120,7 +137,10 @@ pub fn save(account: &str, keys: &UnlockKeys) -> Result<Protection> {
 pub fn load(account: &str, reason: &str) -> Result<(UnlockKeys, Protection)> {
     // Secure Enclave item: the system shows the Touch ID prompt itself.
     match passwords::generic_password(biometry_options(account)) {
-        Ok(b) => return Ok((UnlockKeys::from_bytes(&b)?, Protection::Biometry)),
+        Ok(b) => {
+            let b = Zeroizing::new(b);
+            return Ok((UnlockKeys::from_bytes(&b)?, Protection::Biometry));
+        }
         Err(e) if e.code() == ERR_CANCELED || e.code() == ERR_AUTH_FAILED => {
             return Err(Error::InvalidInput(
                 "Touch ID: cancelled or not recognised".into(),
@@ -129,10 +149,18 @@ pub fn load(account: &str, reason: &str) -> Result<(UnlockKeys, Protection)> {
         Err(e) if e.code() == ERR_NOT_FOUND || e.code() == ERR_MISSING_ENTITLEMENT => {}
         Err(e) => return Err(Error::Protocol(format!("keychain: {e}"))),
     }
-    // Fallback item: check Touch ID ourselves first.
+    // Fallback item: check Touch ID ourselves, *before* reading the item's data. Look up its
+    // attributes first (no data, no keychain prompt) so there's no pointless Touch ID prompt when
+    // nothing is stored.
+    if !fallback_item_exists(account) {
+        return Err(Error::InvalidInput(
+            "Touch ID unlock is not set up for this account".into(),
+        ));
+    }
+    authenticate(reason)?;
     match passwords::get_generic_password(SERVICE, account) {
         Ok(b) => {
-            authenticate(reason)?;
+            let b = Zeroizing::new(b);
             Ok((UnlockKeys::from_bytes(&b)?, Protection::TouchIdGate))
         }
         Err(e) if e.code() == ERR_NOT_FOUND => Err(Error::InvalidInput(
@@ -140,6 +168,18 @@ pub fn load(account: &str, reason: &str) -> Result<(UnlockKeys, Protection)> {
         )),
         Err(e) => Err(Error::Protocol(format!("keychain: {e}"))),
     }
+}
+
+/// Whether the fallback (legacy keychain) item exists, without reading its data.
+fn fallback_item_exists(account: &str) -> bool {
+    use security_framework::item::{ItemClass, ItemSearchOptions};
+    ItemSearchOptions::new()
+        .class(ItemClass::generic_password())
+        .service(SERVICE)
+        .account(account)
+        .load_attributes(true)
+        .search()
+        .is_ok_and(|r| !r.is_empty())
 }
 
 /// Removes stored keys for `account` (both protection levels).
