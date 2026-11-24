@@ -18,13 +18,13 @@ An **unofficial**, pure-Rust client for 1Password accounts. It signs in with you
 | 2FA | authenticator app (TOTP) only. Security keys, Duo and SSO accounts are not supported |
 | Writing (create/edit items) | ❌ read-only |
 
-Version 0.1 is experimental, and the API will change.
+Version 0.2 is experimental, and the API will change.
 
 ## Install
 
 ```toml
 [dependencies]
-onepw = "0.1"
+onepw = "0.2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 

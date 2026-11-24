@@ -1,6 +1,6 @@
 [package]
 name = "onepw"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Unofficial pure-Rust client for 1Password accounts (SRP sign-in, vault and item decryption). Not affiliated with 1Password."
@@ -9,7 +9,7 @@ repository = "https://github.com/twitzelbos/onepw-rs"
 readme = "README.md"
 keywords = ["1password", "password-manager", "srp", "secrets"]
 categories = ["cryptography", "api-bindings", "authentication"]
-exclude = ["/.github"]
+exclude = ["/.github", "/CLAUDE.md"]
 
 [package.metadata.docs.rs]
 all-features = true
